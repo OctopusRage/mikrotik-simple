@@ -67,8 +67,7 @@
   th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
   th { font-size: 12px; color: var(--muted); font-weight: 600; user-select: none; }
   th[data-k] { cursor: pointer; transition: color .15s; }
-  th[data-k]:hover, th.sorted { color: var(--text); }
-  th.sorted::after { content: " ↓"; }
+  th[data-k]:hover { color: var(--text); }
   td.num, th.num { text-align: right; }
   td .sub { color: var(--muted); font-size: 11px; }
   tbody tr { transition: opacity .4s, background-color .2s; }
@@ -183,7 +182,7 @@
   </div>
 
   <div class="card">
-    <h2>Per client <span class="legend">· active first · sampled every <span id="sample">2</span>s · totals since start</span></h2>
+    <h2>Per client <span class="legend">· click a column to sort · sampled every <span id="sample">2</span>s · totals since start</span></h2>
     <div class="tablewrap">
       <table>
         <thead><tr>
@@ -318,7 +317,15 @@ $('logout').onclick = async () => {
 
 // ---------------------------------------------------------------------------
 // Data
-let last = null, sortKey = 'down';
+let last = null, order = null, byName = true;
+const ipCmp = (a, b) => a.localeCompare(b, undefined, { numeric: true });
+const sorters = {
+  // Named clients A→Z first, then unnamed ones by IP.
+  name: (a, b) => (!a.name - !b.name) || (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' })
+    || ipCmp(a.ip, b.ip),
+  down: (a, b) => b.down - a.down, up: (a, b) => b.up - a.up,
+  peak_down: (a, b) => b.peak_down - a.peak_down, bytes_down: (a, b) => b.bytes_down - a.bytes_down,
+};
 const findClient = ip => last && last.clients.find(c => c.ip === ip);
 const label = c => c.name ? `${c.name} (${c.ip})` : c.ip;
 
@@ -404,10 +411,19 @@ const rowMap = new Map();
 
 function render(d) {
   const now = Date.now() / 1000, recent = c => now - c.last_active < 30;
-  const live = c => c.down + c.up > 0 ? 2 : recent(c) ? 1 : 0;
-  const clients = d.clients.slice().sort((a, b) => (live(b) - live(a)) || (sortKey === 'name'
-    ? (a.name || a.ip).localeCompare(b.name || b.ip) : (b[sortKey] - a[sortKey]))
-    || (b.down + b.up - a.down - a.up) || a.ip.localeCompare(b.ip, undefined, { numeric: true }));
+  // No auto-sorting by speed. Default: by name (stable; unnamed last, by IP).
+  // Clicking a numeric column sorts once and then the order stays fixed, with
+  // new clients added at the bottom.
+  const byIp = new Map(d.clients.map(c => [c.ip, c]));
+  if (order === null) {
+    order = d.clients.slice().sort(sorters.name).map(c => c.ip);
+  } else {
+    order = order.filter(ip => byIp.has(ip));
+    const known = new Set(order);
+    order.push(...d.clients.map(c => c.ip).filter(ip => !known.has(ip)).sort(ipCmp));
+  }
+  const clients = order.map(ip => byIp.get(ip));
+  if (byName) order = null;
 
   // Tiles
   tween($('tdown'), clients.reduce((s, c) => s + c.down, 0), fmtRate);
@@ -416,7 +432,6 @@ function render(d) {
   const top = clients.slice().sort((a, b) => (b.down + b.up) - (a.down + a.up))[0];
   setHTML($('ttop'), top && top.down + top.up ? esc(top.name || top.ip) : '–');
   $('sample').textContent = d.sample;
-  document.querySelectorAll('th[data-k]').forEach(th => th.classList.toggle('sorted', th.dataset.k === sortKey));
 
   // Total chart: sum client histories aligned on timestamp.
   const byT = new Map();
@@ -439,6 +454,7 @@ function render(d) {
     let tr = rowMap.get(c.ip);
     if (!tr) {
       tr = document.createElement('tr');
+      tr.dataset.ip = c.ip;
       tr.innerHTML = '<td></td><td class="num down"><span></span></td><td class="num up"><span></span></td>'
         + '<td><canvas class="spark"></canvas></td><td class="num"></td><td class="num"></td><td></td>';
       if (rowMap.size) tr.classList.add('enter');
@@ -483,7 +499,13 @@ function render(d) {
 
 // ---------------------------------------------------------------------------
 // Interactions
-document.querySelectorAll('th[data-k]').forEach(th => th.onclick = () => { sortKey = th.dataset.k; last && render(last); });
+// Header click: sort once by that column, then the order stays fixed.
+document.querySelectorAll('th[data-k]').forEach(th => th.onclick = () => {
+  if (!last) return;
+  byName = th.dataset.k === 'name';
+  order = byName ? null : last.clients.slice().sort(sorters[th.dataset.k]).map(c => c.ip);
+  render(last);
+});
 
 $('rows').addEventListener('click', async e => {
   const b = e.target.closest('button[data-act]'); if (!b) return;
