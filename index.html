@@ -40,6 +40,10 @@
   @keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 60%, transparent); }
                      100% { box-shadow: 0 0 0 7px transparent; } }
   .status.bad .dot { background: var(--err); }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+  .seg button { border: none; border-radius: 0; padding: 2px 8px; font-size: 11px; background: none; color: var(--muted); }
+  .seg button:active { transform: none; }
+  .seg button.on { background: var(--text); color: var(--bg); }
 
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 16px 0; }
   .tile, .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
@@ -169,6 +173,7 @@
   <header>
     <h1>MikroTik client speeds</h1>
     <div id="status" class="status"><span class="dot" id="dot"></span><span id="statustext">connecting…</span>
+      <span class="seg" id="units" title="Show speeds in bytes or bits per second"><button data-u="byte">MB/s</button><button data-u="bit">Mbps</button></span>
       <span id="authLinks" hidden><a class="quiet" id="chpw">· Change password</a>
       <a class="quiet" id="logout">· Log out</a></span></div>
   </header>
@@ -213,8 +218,20 @@
 const $ = id => document.getElementById(id);
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const esc = s => String(s).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
-const fmtRate = b => b >= 1e9 ? (b/1e9).toFixed(2)+' Gbps' : b >= 1e6 ? (b/1e6).toFixed(1)+' Mbps'
-  : b >= 1e3 ? (b/1e3).toFixed(0)+' kbps' : Math.round(b)+' bps';
+// Rates arrive in bits/s; shown as bytes/s (default) or bits/s.
+let unit = 'byte';
+try { if (localStorage.getItem('unit') === 'bit') unit = 'bit'; } catch {}
+const fmtRate = b => {
+  if (unit === 'byte') {
+    b /= 8;
+    return b >= 1e9 ? (b/1e9).toFixed(2)+' GB/s' : b >= 1e6 ? (b/1e6).toFixed(1)+' MB/s'
+      : b >= 1e3 ? (b/1e3).toFixed(0)+' KB/s' : Math.round(b)+' B/s';
+  }
+  return b >= 1e9 ? (b/1e9).toFixed(2)+' Gbps' : b >= 1e6 ? (b/1e6).toFixed(1)+' Mbps'
+    : b >= 1e3 ? (b/1e3).toFixed(0)+' kbps' : Math.round(b)+' bps';
+};
+// Limit dialog works in MB/s or Mbps; this many bits/s per input unit.
+const limUnit = () => unit === 'byte' ? { name: 'MB/s', bps: 8e6 } : { name: 'Mbps', bps: 1e6 };
 const fmtBytes = b => b >= 1e9 ? (b/1e9).toFixed(2)+' GB' : b >= 1e6 ? (b/1e6).toFixed(1)+' MB'
   : b >= 1e3 ? (b/1e3).toFixed(0)+' KB' : Math.round(b)+' B';
 const fmtLim = b => b ? fmtRate(b) : '∞';
@@ -256,7 +273,7 @@ function modal({ title, sub = '', error = '', fields = [], hint = '', ok = 'Save
       ${error ? `<div class="err" style="margin:4px 0 0">${esc(error)}</div>` : ''}
       ${fields.map(f => `<label for="m_${f.name}">${esc(f.label)}</label>
         <input id="m_${f.name}" name="${f.name}" type="${f.type || 'text'}" value="${esc(f.value ?? '')}"
-          placeholder="${esc(f.placeholder || '')}" ${f.type === 'number' ? 'min="0" step="0.1"' : ''}>`).join('')}
+          placeholder="${esc(f.placeholder || '')}" ${f.type === 'number' ? 'min="0" step="any"' : ''}>`).join('')}
       ${hint ? `<div class="hint">${esc(hint)}</div>` : ''}
       <div class="actions">
         ${extra ? `<button type="button" class="left" data-extra>${esc(extra)}</button>` : ''}
@@ -561,6 +578,17 @@ document.querySelectorAll('th[data-k]').forEach(th => th.onclick = () => {
   render(last);
 });
 
+const showUnit = () => document.querySelectorAll('#units button')
+  .forEach(b => b.classList.toggle('on', b.dataset.u === unit));
+showUnit();
+$('units').onclick = e => {
+  const b = e.target.closest('button'); if (!b || b.dataset.u === unit) return;
+  unit = b.dataset.u;
+  try { localStorage.setItem('unit', unit); } catch {}
+  showUnit();
+  if (last) render(last);
+};
+
 $('hideIdle').onchange = e => {
   hideIdle = e.target.checked;
   try { localStorage.setItem('hideIdle', hideIdle ? '1' : '0'); } catch {}
@@ -580,17 +608,20 @@ $('rows').addEventListener('click', async e => {
       toast(v.alias ? `Renamed to ${v.alias}` : 'Name cleared');
 
   } else if (b.dataset.act === 'limit') {
+    const u = limUnit(), cur = bps => bps ? +(bps / u.bps).toFixed(3) : '';
     const v = await modal({ title: 'Limit speed', sub: label(c),
       fields: [
-        { name: 'down', label: 'Max download (Mbps)', type: 'number', value: c.limit?.down ? c.limit.down / 1e6 : '', placeholder: '0 = unlimited' },
-        { name: 'up', label: 'Max upload (Mbps)', type: 'number', value: c.limit?.up ? c.limit.up / 1e6 : '', placeholder: '0 = unlimited' }],
+        { name: 'down', label: `Max download (${u.name})`, type: 'number', value: cur(c.limit?.down), placeholder: '0 = unlimited' },
+        { name: 'up', label: `Max upload (${u.name})`, type: 'number', value: cur(c.limit?.up), placeholder: '0 = unlimited' }],
       hint: 'Applied as a MikroTik simple queue. The client’s DHCP lease is made static so it keeps this IP.',
       extra: c.limit ? 'Remove limit' : null });
     if (!v) return;
     if (v.extra) {
       if (await control({ action: 'unlimit', ip }, b)) toast(`Limit removed for ${c.name || ip}`);
-    } else if (await control({ action: 'limit', ip, down_mbps: v.down || 0, up_mbps: v.up || 0 }, b)) {
-      toast(+v.down || +v.up ? `Limited ${c.name || ip} to ↓${fmtLim(v.down * 1e6)} ↑${fmtLim(v.up * 1e6)}` : `Limit removed for ${c.name || ip}`);
+    } else {
+      const down = (+v.down || 0) * u.bps, up = (+v.up || 0) * u.bps;
+      if (await control({ action: 'limit', ip, down_mbps: down / 1e6, up_mbps: up / 1e6 }, b))
+        toast(down || up ? `Limited ${c.name || ip} to ↓${fmtLim(down)} ↑${fmtLim(up)}` : `Limit removed for ${c.name || ip}`);
     }
 
   } else if (b.dataset.act === 'block') {
