@@ -50,6 +50,9 @@
   .down { color: var(--down); } .up { color: var(--up); }
   .card { padding: 14px; margin-bottom: 16px; }
   .card h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
+  .card h2 .opt { float: right; font-weight: 400; cursor: pointer; user-select: none; }
+  .card h2 .opt input { vertical-align: -2px; margin: 0 4px 0 0; accent-color: var(--down); }
+  td.empty { text-align: center; color: var(--muted); padding: 18px 6px; white-space: normal; }
   .legend { font-size: 12px; color: var(--muted); font-weight: 400; }
   .legend .down::before, .legend .up::before { content: ""; display: inline-block; width: 10px; height: 3px;
     margin: 0 4px 3px 10px; vertical-align: middle; background: currentColor; border-radius: 2px; }
@@ -183,7 +186,8 @@
   </div>
 
   <div class="card">
-    <h2>Per client <span class="legend">· click a column to sort · sampled every <span id="sample">2</span>s, only while this page is open · totals cover that time</span></h2>
+    <h2>Per client <label class="opt"><input type="checkbox" id="hideIdle" checked>Hide inactive</label>
+      <span class="legend">· active first, then by name · click a column to sort · sampled every <span id="sample">2</span>s, only while this page is open · totals cover that time</span></h2>
     <div class="tablewrap">
       <table>
         <thead><tr>
@@ -349,11 +353,17 @@ $('logout').onclick = async () => {
 // ---------------------------------------------------------------------------
 // Data
 let last = null, order = null, byName = true;
+let hideIdle = true;
+try { hideIdle = localStorage.getItem('hideIdle') !== '0'; } catch {}
+$('hideIdle').checked = hideIdle;
+// Active = moved traffic in the last 30 s (same rule that greys out a row).
+const isActive = c => Date.now() / 1000 - c.last_active < 30;
 const ipCmp = (a, b) => a.localeCompare(b, undefined, { numeric: true });
+const byLabel = (a, b) => (!a.name - !b.name)
+  || (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' }) || ipCmp(a.ip, b.ip);
 const sorters = {
-  // Named clients A→Z first, then unnamed ones by IP.
-  name: (a, b) => (!a.name - !b.name) || (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' })
-    || ipCmp(a.ip, b.ip),
+  // Active clients first; within each group named A→Z, then unnamed by IP.
+  name: (a, b) => (isActive(b) - isActive(a)) || byLabel(a, b),
   down: (a, b) => b.down - a.down, up: (a, b) => b.up - a.up,
   peak_down: (a, b) => b.peak_down - a.peak_down, bytes_down: (a, b) => b.bytes_down - a.bytes_down,
 };
@@ -443,8 +453,7 @@ function draw(canvas, series, opts = {}) {
 const rowMap = new Map();
 
 function render(d) {
-  const now = Date.now() / 1000, recent = c => now - c.last_active < 30;
-  // No auto-sorting by speed. Default: by name (stable; unnamed last, by IP).
+  // No auto-sorting by speed. Default: active first, then by name.
   // Clicking a numeric column sorts once and then the order stays fixed, with
   // new clients added at the bottom.
   const byIp = new Map(d.clients.map(c => [c.ip, c]));
@@ -455,14 +464,16 @@ function render(d) {
     const known = new Set(order);
     order.push(...d.clients.map(c => c.ip).filter(ip => !known.has(ip)).sort(ipCmp));
   }
-  const clients = order.map(ip => byIp.get(ip));
+  const all = order.map(ip => byIp.get(ip));
   if (byName) order = null;
+  // Blocked / limited clients stay visible so their controls are reachable.
+  const clients = hideIdle ? all.filter(c => isActive(c) || c.blocked || c.limit) : all;
 
   // Tiles
-  tween($('tdown'), clients.reduce((s, c) => s + c.down, 0), fmtRate);
-  tween($('tup'), clients.reduce((s, c) => s + c.up, 0), fmtRate);
-  setHTML($('tactive'), `${clients.filter(c => c.down + c.up > 0).length} / ${clients.length}`);
-  const top = clients.slice().sort((a, b) => (b.down + b.up) - (a.down + a.up))[0];
+  tween($('tdown'), all.reduce((s, c) => s + c.down, 0), fmtRate);
+  tween($('tup'), all.reduce((s, c) => s + c.up, 0), fmtRate);
+  setHTML($('tactive'), `${all.filter(c => c.down + c.up > 0).length} / ${all.length}`);
+  const top = all.slice().sort((a, b) => (b.down + b.up) - (a.down + a.up))[0];
   setHTML($('ttop'), top && top.down + top.up ? esc(top.name || top.ip) : '–');
   $('sample').textContent = d.sample;
 
@@ -494,7 +505,7 @@ function render(d) {
       rowMap.set(c.ip, tr);
     }
     tr.classList.toggle('blocked', c.blocked);
-    tr.classList.toggle('idle', !c.blocked && !recent(c));
+    tr.classList.toggle('idle', !c.blocked && !isActive(c));
     const td = tr.children;
     const sub = [c.ip, c.mac, c.alias && c.host && c.host !== c.alias ? c.host : ''].filter(Boolean).join(' · ');
     setHTML(td[0], `<div>${esc(c.name || '(unknown)')} <button class="link" data-act="alias" data-ip="${c.ip}" title="Rename">✎</button>`
@@ -519,6 +530,16 @@ function render(d) {
     tr.classList.add('leave');
     setTimeout(() => tr.remove(), 400);
   }
+  let empty = $('emptyRow');
+  if (!clients.length) {
+    if (!empty) {
+      empty = document.createElement('tr'); empty.id = 'emptyRow';
+      empty.innerHTML = `<td class="empty" colspan="7"></td>`;
+    }
+    empty.firstChild.textContent = all.length
+      ? `No active clients right now · ${all.length} inactive hidden` : 'No clients yet';
+    tb.appendChild(empty);
+  } else if (empty) empty.remove();
   if (reduced) return;
   for (const [ip, tr] of rowMap) {
     const old = before.get(ip);
@@ -539,6 +560,12 @@ document.querySelectorAll('th[data-k]').forEach(th => th.onclick = () => {
   order = byName ? null : last.clients.slice().sort(sorters[th.dataset.k]).map(c => c.ip);
   render(last);
 });
+
+$('hideIdle').onchange = e => {
+  hideIdle = e.target.checked;
+  try { localStorage.setItem('hideIdle', hideIdle ? '1' : '0'); } catch {}
+  if (last) render(last);
+};
 
 $('rows').addEventListener('click', async e => {
   const b = e.target.closest('button[data-act]'); if (!b) return;
