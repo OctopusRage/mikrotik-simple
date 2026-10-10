@@ -1,25 +1,56 @@
 #!/usr/bin/env python3
 """Live per-client speed dashboard for the MikroTik hEX.
 
-Polls `/tool torch` on the LAN bridge over SSH (alias ssh.mikrotik), sums the
-per-flow rates by LAN client, and serves a live page at http://127.0.0.1:8088.
-Stdlib only. Run: python3 server.py [--port 8088]
+Polls `/tool torch` on the LAN bridge over SSH, sums the per-flow rates by LAN
+client, and serves a live page at http://127.0.0.1:8088.
+Stdlib only. Run: python3 server.py [--bind 127.0.0.1] [--port 8088]
+
+Configured by environment variables (defaults in brackets):
+  MIKROTIK_HOST   SSH host or ~/.ssh/config alias        [ssh.mikrotik]
+  MIKROTIK_USER   SSH user (blank = from ssh config)      []
+  MIKROTIK_PORT   SSH port                                [22]
+  SSH_KEY         private key file (blank = ssh default)  []
+  LAN_IFACE       LAN interface to torch                  [bridge]
+  LAN_CIDR        LAN subnet                              [192.168.88.0/24]
+  ROUTER_IP       router's LAN IP (excluded)              [192.168.88.1]
+  STATIC_NAMES    JSON {ip: name} for lease-less clients  [{}]
+  DATA_DIR        where aliases.json lives                [script dir]
+  BIND, PORT      listen address                          [127.0.0.1, 8088]
+  DASH_PASSWORD   require this password to log in         [] (no login)
+  SSH_KNOWN_HOSTS known_hosts file; auto-accepts new keys []
 """
-import argparse, ipaddress, json, os, re, subprocess, threading, time
+import argparse, hashlib, hmac, ipaddress, json, os, re, subprocess, threading, time
 from collections import deque
+from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-HOST = "ssh.mikrotik"
-IFACE = "bridge"
-LAN = ipaddress.ip_network("192.168.88.0/24")
-ROUTER_IP = "192.168.88.1"
+env = os.environ.get
+HOST = env("MIKROTIK_HOST", "ssh.mikrotik")
+USER = env("MIKROTIK_USER", "")
+SSH_PORT = env("MIKROTIK_PORT", "")
+SSH_KEY = env("SSH_KEY", "")
+IFACE = env("LAN_IFACE", "bridge")
+LAN = ipaddress.ip_network(env("LAN_CIDR", "192.168.88.0/24"))
+ROUTER_IP = env("ROUTER_IP", "192.168.88.1")
 SAMPLE = 2          # torch duration per sample, seconds
 HISTORY = 300       # samples kept per client (~10 min at 2s)
 # Names for clients with no DHCP lease (static IPs).
-STATIC_NAMES = {"192.168.88.2": "Orange Pi (AdGuard)"}
+STATIC_NAMES = json.loads(env("STATIC_NAMES") or "{}")
 HERE = os.path.dirname(os.path.abspath(__file__))
-ALIASES = os.path.join(HERE, "aliases.json")   # {MAC or "ip:<ip>": alias}
-CTL = os.path.expanduser("~/.cache/mikrotik-dash-ssh.sock")
+DATA_DIR = env("DATA_DIR", HERE)
+ALIASES = os.path.join(DATA_DIR, "aliases.json")   # {MAC or "ip:<ip>": alias}
+CTL = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", f"mikrotik-dash-{os.getuid()}.sock")
+SSH_OPTS = ["-o", "LogLevel=ERROR", "-o", "BatchMode=yes",
+            "-o", "ControlMaster=auto", "-o", f"ControlPath={CTL}", "-o", "ControlPersist=10m"]
+if USER:
+    SSH_OPTS += ["-l", USER]
+if SSH_PORT:
+    SSH_OPTS += ["-p", SSH_PORT]
+if SSH_KEY:
+    SSH_OPTS += ["-i", SSH_KEY, "-o", "IdentitiesOnly=yes"]
+if env("SSH_KNOWN_HOSTS"):   # e.g. a writable file in the container's data volume
+    SSH_OPTS += ["-o", f"UserKnownHostsFile={env('SSH_KNOWN_HOSTS')}",
+                 "-o", "StrictHostKeyChecking=accept-new"]
 
 lock = threading.Lock()
 state = {"clients": {}, "names": {}, "limits": {}, "blocked": set(), "updated": 0, "error": None, "wan": None}
@@ -28,9 +59,7 @@ state = {"clients": {}, "names": {}, "limits": {}, "blocked": set(), "updated": 
 def ros(cmd, timeout=20):
     """Run a RouterOS command over a persistent (ControlMaster) SSH connection."""
     out = subprocess.run(
-        ["ssh", "-o", "LogLevel=ERROR", "-o", "BatchMode=yes",
-         "-o", "ControlMaster=auto", "-o", f"ControlPath={CTL}", "-o", "ControlPersist=10m",
-         HOST, cmd],
+        ["ssh", *SSH_OPTS, HOST, cmd],
         capture_output=True, text=True, timeout=timeout)
     if out.returncode != 0:
         raise RuntimeError(out.stderr.strip() or f"ssh exit {out.returncode}")
@@ -308,34 +337,79 @@ def snapshot():
                 "sample": SAMPLE}
 
 
+# --- Auth --------------------------------------------------------------------
+# Optional: with DASH_PASSWORD set, every page and API call needs a login.
+# The session cookie is an HMAC of the password, so it survives restarts and
+# is invalidated by changing the password.
+PASSWORD = env("DASH_PASSWORD", "")
+COOKIE = "mtdash_session"
+
+
+def session_token():
+    return hmac.new(PASSWORD.encode(), b"mikrotik-dash-session", hashlib.sha256).hexdigest()
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def do_GET(self):
-        if self.path.startswith("/api/stats"):
-            body, ctype = json.dumps(snapshot()).encode(), "application/json"
-        elif self.path in ("/", "/index.html"):
-            with open(os.path.join(HERE, "index.html"), "rb") as f:
-                body, ctype = f.read(), "text/html; charset=utf-8"
-        else:
-            self.send_error(404)
-            return
-        self.send_response(200)
+    def authed(self):
+        if not PASSWORD:
+            return True
+        c = SimpleCookie(self.headers.get("Cookie", ""))
+        return COOKIE in c and hmac.compare_digest(c[COOKIE].value, session_token())
+
+    def reply(self, code, body=b"", ctype="text/html; charset=utf-8", headers=()):
+        self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
+        for k, v in headers:
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        # The page itself is public (it holds the login view); data needs a session.
+        if path in ("/", "/index.html"):
+            with open(os.path.join(HERE, "index.html"), "rb") as f:
+                return self.reply(200, f.read())
+        if not self.authed():
+            return self.reply(401, b'{"error": "login required"}', "application/json")
+        if path == "/api/stats":
+            data = snapshot()
+            data["auth"] = bool(PASSWORD)
+            self.reply(200, json.dumps(data).encode(), "application/json")
+        else:
+            self.send_error(404)
+
     def do_POST(self):
+        length = min(int(self.headers.get("Content-Length", 0)), 64 * 1024)
+        raw = self.rfile.read(length)
+        if self.path == "/api/login":
+            try:
+                pw = str(json.loads(raw).get("password", ""))
+            except ValueError:
+                pw = ""
+            if PASSWORD and hmac.compare_digest(pw.encode(), PASSWORD.encode()):
+                return self.reply(200, b'{"ok": true}', "application/json", [("Set-Cookie",
+                                  f"{COOKIE}={session_token()}; Max-Age=2592000; Path=/; "
+                                  f"HttpOnly; SameSite=Strict")])
+            time.sleep(1)   # slow down password guessing
+            return self.reply(401, b'{"ok": false, "error": "Wrong password"}', "application/json")
+        if self.path == "/api/logout":
+            return self.reply(200, b'{"ok": true}', "application/json", [("Set-Cookie",
+                              f"{COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict")])
         # JSON-only so a cross-site form post can't trigger it (needs CORS preflight).
-        if self.path != "/api/control" or \
-                not self.headers.get("Content-Type", "").startswith("application/json"):
-            self.send_error(404 if self.path != "/api/control" else 415)
-            return
+        if self.path != "/api/control":
+            return self.send_error(404)
+        if not self.authed():
+            return self.reply(401, b'{"ok": false, "error": "login required"}', "application/json")
+        if not self.headers.get("Content-Type", "").startswith("application/json"):
+            return self.send_error(415)
         try:
-            req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            req = json.loads(raw)
             ip = str(req.get("ip", ""))
             if not lan_ip(ip):
                 raise ValueError("not a LAN client IP")
@@ -357,20 +431,16 @@ class Handler(BaseHTTPRequestHandler):
             code, body = 200, {"ok": True}
         except Exception as e:
             code, body = 400, {"ok": False, "error": str(e)}
-        data = json.dumps(body).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        self.reply(code, json.dumps(body).encode(), "application/json")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=8088)
-    ap.add_argument("--bind", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=int(env("PORT", "8088")))
+    ap.add_argument("--bind", default=env("BIND", "127.0.0.1"))
     args = ap.parse_args()
-    os.makedirs(os.path.dirname(CTL), exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
     threading.Thread(target=poller, daemon=True).start()
-    print(f"MikroTik dashboard on http://{args.bind}:{args.port}")
+    print(f"MikroTik dashboard on http://{args.bind}:{args.port}"
+          f" ({'password protected' if PASSWORD else 'no password'})", flush=True)
     ThreadingHTTPServer((args.bind, args.port), Handler).serve_forever()

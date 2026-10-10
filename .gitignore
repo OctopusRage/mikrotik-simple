@@ -1,3 +1,5 @@
 aliases.json
 *.tmp
 __pycache__/
+.env
+data/

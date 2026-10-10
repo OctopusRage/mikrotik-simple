@@ -1,0 +1,24 @@
+# Copy .env.example to .env, fill it in, then: docker compose up -d --build
+services:
+  mikrotik-dash:
+    build: .
+    image: mikrotik-dash
+    container_name: mikrotik-dash
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8088}:8088"
+    environment:
+      MIKROTIK_HOST: ${MIKROTIK_HOST:-192.168.88.1}
+      MIKROTIK_USER: ${MIKROTIK_USER:-admin}
+      MIKROTIK_PORT: ${MIKROTIK_PORT:-22}
+      SSH_KEY: /run/secrets/mikrotik_key
+      LAN_IFACE: ${LAN_IFACE:-bridge}
+      LAN_CIDR: ${LAN_CIDR:-192.168.88.0/24}
+      ROUTER_IP: ${ROUTER_IP:-192.168.88.1}
+      STATIC_NAMES: ${STATIC_NAMES:-}
+      # The port is reachable from your network, so a password is required.
+      DASH_PASSWORD: ${DASH_PASSWORD:?Set DASH_PASSWORD in .env}
+    volumes:
+      # Private key the router accepts (imported with /user ssh-keys import).
+      - ${SSH_KEY_FILE:-~/.ssh/id_rsa}:/run/secrets/mikrotik_key:ro
+      - ./data:/data

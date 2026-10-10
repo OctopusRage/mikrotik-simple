@@ -6,14 +6,25 @@ password needed — it talks to RouterOS over SSH.
 
 ## Run
 
+**Docker (recommended):**
+
 ```sh
-python3 server.py            # http://127.0.0.1:8088
-python3 server.py --bind 0.0.0.0 --port 8088   # reachable from the LAN
+cp .env.example .env      # set MIKROTIK_HOST, SSH_KEY_FILE, DASH_PASSWORD, ...
+docker compose up -d --build
 ```
 
-Requires an SSH host alias `ssh.mikrotik` (key auth) to the router. Edit the
-constants at the top of `server.py` for your setup (`HOST`, `IFACE`, `LAN`,
-`ROUTER_IP`, `STATIC_NAMES`).
+**As a systemd user service:**
+
+```sh
+./install.sh              # asks for router host + password, then starts it
+./install.sh --uninstall
+```
+
+**By hand:** `python3 server.py` (config via environment variables, listed at
+the top of `server.py`).
+
+The router must accept key-based SSH from wherever this runs (import the public
+key on the router with `/user ssh-keys import`).
 
 ## How it works
 
@@ -33,5 +44,7 @@ constants at the top of `server.py` for your setup (`HOST`, `IFACE`, `LAN`,
 Everything it creates on the router is commented `dash-limit`. Changing a limit
 or block drops the client's tracked connections so it takes effect at once.
 
-The control endpoint only accepts JSON POSTs, so a cross-site form can't trigger
-it. There is no login; keep it bound to localhost or a trusted LAN.
+Set `DASH_PASSWORD` to require a login (session cookie, HttpOnly, SameSite=Strict;
+changing the password logs everyone out). API calls only accept JSON POSTs, so a
+cross-site form can't trigger them. Without a password, keep it bound to
+localhost.
