@@ -1,0 +1,3 @@
+aliases.json
+*.tmp
+__pycache__/
