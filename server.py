@@ -16,7 +16,8 @@ Configured by environment variables (defaults in brackets):
   STATIC_NAMES    JSON {ip: name} for lease-less clients  [{}]
   DATA_DIR        where aliases.json lives                [script dir]
   BIND, PORT      listen address                          [127.0.0.1, 8088]
-  DASH_PASSWORD   require this password to log in         [] (no login)
+  DASH_PASSWORD   initial login password; can be changed  [] (no login)
+                  in the dashboard, changing it here resets that
   SSH_KNOWN_HOSTS known_hosts file; auto-accepts new keys []
 """
 import argparse, hashlib, hmac, ipaddress, json, os, re, subprocess, threading, time
@@ -338,15 +339,71 @@ def snapshot():
 
 
 # --- Auth --------------------------------------------------------------------
-# Optional: with DASH_PASSWORD set, every page and API call needs a login.
-# The session cookie is an HMAC of the password, so it survives restarts and
-# is invalidated by changing the password.
+# Optional: with a password set, every API call needs a login.
+# DASH_PASSWORD is the initial password. Changing it in the dashboard stores a
+# salted PBKDF2 hash in DATA_DIR/auth.json, which then wins — until
+# DASH_PASSWORD itself is changed, which resets it (the lock-out escape hatch).
+# The session cookie is an HMAC keyed by the stored hash: it survives restarts
+# and every session is invalidated when the password changes.
 PASSWORD = env("DASH_PASSWORD", "")
+AUTH_FILE = os.path.join(DATA_DIR, "auth.json")
 COOKIE = "mtdash_session"
+MIN_PASSWORD = 8
+ENV_SALT = b"mikrotik-dash-env"   # fixed so the env password hashes the same on every start
+
+
+def hash_pw(pw, salt=None, iters=200_000):
+    salt = salt or os.urandom(16)
+    return {"salt": salt.hex(), "iters": iters,
+            "hash": hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iters).hex()}
+
+
+def load_auth():
+    env_rec = hash_pw(PASSWORD, ENV_SALT) if PASSWORD else None
+    try:
+        with open(AUTH_FILE) as f:
+            rec = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return env_rec
+    if env_rec and rec.get("env_hash") != env_rec["hash"]:
+        # DASH_PASSWORD changed since the dashboard password was set: reset.
+        os.remove(AUTH_FILE)
+        print("DASH_PASSWORD changed: dashboard-set password reset", flush=True)
+        return env_rec
+    return rec
+
+
+auth = load_auth()
+
+
+def check_pw(pw):
+    rec = auth
+    if not rec:
+        return False
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(rec["salt"]), rec["iters"]).hex()
+    return hmac.compare_digest(h, rec["hash"])
+
+
+def set_password(pw):
+    global auth
+    rec = hash_pw(pw)
+    if PASSWORD:
+        rec["env_hash"] = hash_pw(PASSWORD, ENV_SALT)["hash"]
+    tmp = AUTH_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(rec, f)
+    os.replace(tmp, AUTH_FILE)
+    auth = rec
 
 
 def session_token():
-    return hmac.new(PASSWORD.encode(), b"mikrotik-dash-session", hashlib.sha256).hexdigest()
+    return hmac.new(bytes.fromhex(auth["hash"]), b"mikrotik-dash-session", hashlib.sha256).hexdigest()
+
+
+def session_cookie():
+    return ("Set-Cookie", f"{COOKIE}={session_token()}; Max-Age=2592000; Path=/; "
+                          f"HttpOnly; SameSite=Strict")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -354,7 +411,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def authed(self):
-        if not PASSWORD:
+        if not auth:
             return True
         c = SimpleCookie(self.headers.get("Cookie", ""))
         return COOKIE in c and hmac.compare_digest(c[COOKIE].value, session_token())
@@ -379,7 +436,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(401, b'{"error": "login required"}', "application/json")
         if path == "/api/stats":
             data = snapshot()
-            data["auth"] = bool(PASSWORD)
+            data["auth"] = bool(auth)
             self.reply(200, json.dumps(data).encode(), "application/json")
         else:
             self.send_error(404)
@@ -392,15 +449,34 @@ class Handler(BaseHTTPRequestHandler):
                 pw = str(json.loads(raw).get("password", ""))
             except ValueError:
                 pw = ""
-            if PASSWORD and hmac.compare_digest(pw.encode(), PASSWORD.encode()):
-                return self.reply(200, b'{"ok": true}', "application/json", [("Set-Cookie",
-                                  f"{COOKIE}={session_token()}; Max-Age=2592000; Path=/; "
-                                  f"HttpOnly; SameSite=Strict")])
+            if check_pw(pw):
+                return self.reply(200, b'{"ok": true}', "application/json", [session_cookie()])
             time.sleep(1)   # slow down password guessing
             return self.reply(401, b'{"ok": false, "error": "Wrong password"}', "application/json")
         if self.path == "/api/logout":
             return self.reply(200, b'{"ok": true}', "application/json", [("Set-Cookie",
                               f"{COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict")])
+        if self.path == "/api/password":
+            if not self.authed() or not auth:
+                return self.reply(401, b'{"ok": false, "error": "login required"}', "application/json")
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return self.send_error(415)
+            try:
+                req = json.loads(raw)
+                current, new = str(req.get("current", "")), str(req.get("new", ""))
+            except ValueError:
+                return self.reply(400, b'{"ok": false, "error": "bad request"}', "application/json")
+            if not check_pw(current):
+                time.sleep(1)
+                return self.reply(403, b'{"ok": false, "error": "Current password is wrong"}',
+                                  "application/json")
+            if len(new) < MIN_PASSWORD:
+                return self.reply(400, json.dumps({"ok": False, "error":
+                                  f"New password must be at least {MIN_PASSWORD} characters"}).encode(),
+                                  "application/json")
+            set_password(new)
+            # New hash → every old session is invalid; keep this one logged in.
+            return self.reply(200, b'{"ok": true}', "application/json", [session_cookie()])
         # JSON-only so a cross-site form post can't trigger it (needs CORS preflight).
         if self.path != "/api/control":
             return self.send_error(404)
@@ -442,5 +518,5 @@ if __name__ == "__main__":
     os.makedirs(DATA_DIR, exist_ok=True)
     threading.Thread(target=poller, daemon=True).start()
     print(f"MikroTik dashboard on http://{args.bind}:{args.port}"
-          f" ({'password protected' if PASSWORD else 'no password'})", flush=True)
+          f" ({'password protected' if auth else 'no password'})", flush=True)
     ThreadingHTTPServer((args.bind, args.port), Handler).serve_forever()

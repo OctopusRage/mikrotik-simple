@@ -3,3 +3,4 @@ aliases.json
 __pycache__/
 .env
 data/
+auth.json

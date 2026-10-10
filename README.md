@@ -44,7 +44,9 @@ key on the router with `/user ssh-keys import`).
 Everything it creates on the router is commented `dash-limit`. Changing a limit
 or block drops the client's tracked connections so it takes effect at once.
 
-Set `DASH_PASSWORD` to require a login (session cookie, HttpOnly, SameSite=Strict;
-changing the password logs everyone out). API calls only accept JSON POSTs, so a
+Set `DASH_PASSWORD` to require a login (session cookie, HttpOnly, SameSite=Strict).
+The password can be changed in the dashboard (**Change password**, top right); it
+is stored as a salted PBKDF2 hash in `DATA_DIR/auth.json` and logs out other
+devices. Forgot it? Change `DASH_PASSWORD` and restart: that resets it. API calls only accept JSON POSTs, so a
 cross-site form can't trigger them. Without a password, keep it bound to
 localhost.

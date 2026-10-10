@@ -166,7 +166,8 @@
   <header>
     <h1>MikroTik client speeds</h1>
     <div id="status" class="status"><span class="dot" id="dot"></span><span id="statustext">connecting…</span>
-      <a class="quiet" id="logout" hidden>· Log out</a></div>
+      <span id="authLinks" hidden><a class="quiet" id="chpw">· Change password</a>
+      <a class="quiet" id="logout">· Log out</a></span></div>
   </header>
 
   <div class="tiles">
@@ -242,12 +243,13 @@ function toast(msg, isErr = false) {
 }
 
 // One reusable modal sheet. Resolves with the form values, or null on cancel.
-function modal({ title, sub = '', fields = [], hint = '', ok = 'Save', danger = false, extra = null }) {
+function modal({ title, sub = '', error = '', fields = [], hint = '', ok = 'Save', danger = false, extra = null }) {
   return new Promise(resolve => {
     const bd = document.createElement('div');
     bd.className = 'backdrop';
     bd.innerHTML = `<form class="sheet">
       <h3>${esc(title)}</h3>${sub ? `<div class="sub">${esc(sub)}</div>` : ''}
+      ${error ? `<div class="err" style="margin:4px 0 0">${esc(error)}</div>` : ''}
       ${fields.map(f => `<label for="m_${f.name}">${esc(f.label)}</label>
         <input id="m_${f.name}" name="${f.name}" type="${f.type || 'text'}" value="${esc(f.value ?? '')}"
           placeholder="${esc(f.placeholder || '')}" ${f.type === 'number' ? 'min="0" step="0.1"' : ''}>`).join('')}
@@ -310,6 +312,27 @@ $('loginForm').onsubmit = async e => {
   } finally { btn.classList.remove('busy'); }
 };
 
+$('chpw').onclick = async () => {
+  let err = '';
+  for (;;) {
+    const v = await modal({ title: 'Change password', error: err,
+      fields: [
+        { name: 'current', label: 'Current password', type: 'password' },
+        { name: 'new', label: 'New password', type: 'password', placeholder: 'At least 8 characters' },
+        { name: 'confirm', label: 'Repeat new password', type: 'password' }],
+      hint: 'Other devices will be logged out.', ok: 'Change' });
+    if (!v) return;
+    if (v.new !== v.confirm) { err = 'The new passwords don’t match.'; continue; }
+    if (v.new.length < 8) { err = 'New password must be at least 8 characters.'; continue; }
+    const r = await fetch('/api/password', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ current: v.current, new: v.new }) });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) { toast('Password changed. Other devices were logged out.'); return; }
+    if (r.status === 401) { show('login'); return; }
+    err = j.error || 'Could not change the password.';
+  }
+};
+
 $('logout').onclick = async () => {
   await fetch('/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
   show('login');
@@ -336,7 +359,7 @@ async function tick() {
     const d = await r.json();
     last = d;
     render(d);
-    $('logout').hidden = !d.auth;
+    $('authLinks').hidden = !d.auth;
     const age = d.updated ? Math.round(Date.now() / 1000 - d.updated) : null;
     const bad = !!d.error || age === null || age > 15;
     $('status').classList.toggle('bad', bad);
