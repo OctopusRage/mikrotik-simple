@@ -178,12 +178,12 @@
   </div>
 
   <div class="card">
-    <h2>All clients, last 10 min <span class="legend"><span class="down">download</span><span class="up">upload</span></span></h2>
+    <h2>All clients, last 10 min while open <span class="legend"><span class="down">download</span><span class="up">upload</span></span></h2>
     <canvas id="total"></canvas>
   </div>
 
   <div class="card">
-    <h2>Per client <span class="legend">· click a column to sort · sampled every <span id="sample">2</span>s · totals since start</span></h2>
+    <h2>Per client <span class="legend">· click a column to sort · sampled every <span id="sample">2</span>s, only while this page is open · totals cover that time</span></h2>
     <div class="tablewrap">
       <table>
         <thead><tr>
@@ -282,12 +282,20 @@ function modal({ title, sub = '', error = '', fields = [], hint = '', ok = 'Save
 
 // ---------------------------------------------------------------------------
 // Views (login ⇄ dashboard) without page loads
-let polling = null;
+let polling = null, shownAt = Date.now();
+const sinceShown = () => (Date.now() - shownAt) / 1000;
+// Measuring slows the router (see README), so only poll while the tab is
+// visible; the server stops measuring ~15s after the last poll.
+document.addEventListener('visibilitychange', () => {
+  if ($('app').hidden) return;
+  if (document.hidden) { clearInterval(polling); polling = null; }
+  else if (!polling) { shownAt = Date.now(); tick(); polling = setInterval(tick, 2000); }
+});
 function show(view) {
   $('login').hidden = view !== 'login';
   $('app').hidden = view !== 'app';
   if (view === 'app') {
-    if (!polling) { tick(); polling = setInterval(tick, 2000); }
+    if (!polling) { shownAt = Date.now(); tick(); polling = setInterval(tick, 2000); }
   } else {
     clearInterval(polling); polling = null;
     $('loginPw').value = ''; $('loginErr').textContent = '';
@@ -361,10 +369,12 @@ async function tick() {
     render(d);
     $('authLinks').hidden = !d.auth;
     const age = d.updated ? Math.round(Date.now() / 1000 - d.updated) : null;
-    const bad = !!d.error || age === null || age > 15;
+    // Right after opening, the server is (re)starting measurement: not an error.
+    const starting = d.paused || age === null || (age > 15 && !d.error && sinceShown() < 10);
+    const bad = !starting && (!!d.error || age > 15);
     $('status').classList.toggle('bad', bad);
     $('statustext').textContent = d.error ? 'router error: ' + d.error
-      : age === null ? 'waiting for first sample…' : `live · updated ${age}s ago`;
+      : starting ? 'starting live measurement…' : `live · updated ${age}s ago`;
     if (!bad) { const dot = $('dot'); dot.classList.remove('pulse'); void dot.offsetWidth; dot.classList.add('pulse'); }
   } catch {
     $('status').classList.add('bad');

@@ -54,7 +54,7 @@ if env("SSH_KNOWN_HOSTS"):   # e.g. a writable file in the container's data volu
                  "-o", "StrictHostKeyChecking=accept-new"]
 
 lock = threading.Lock()
-state = {"clients": {}, "names": {}, "limits": {}, "blocked": set(), "updated": 0, "error": None, "wan": None}
+state = {"clients": {}, "names": {}, "limits": {}, "blocked": set(), "paused": True, "updated": 0, "error": None, "wan": None}
 
 
 def ros(cmd, timeout=20):
@@ -285,9 +285,42 @@ def sample():
     return agg
 
 
+# Torch takes LAN traffic off the router's fast path (measured: ~35% lower peak
+# throughput on the hEX), so only sample while someone is looking: a stats
+# request marks the dashboard as viewed, and after IDLE_AFTER seconds without
+# one the poller stops running torch.
+IDLE_AFTER = 15
+last_viewed = 0.0
+viewed = threading.Event()
+
+
+def mark_viewed():
+    global last_viewed
+    last_viewed = time.time()
+    viewed.set()
+
+
 def poller():
     last_names = 0
+    paused = True
     while True:
+        if time.time() - last_viewed > IDLE_AFTER:
+            if not paused:
+                paused = True
+                with lock:
+                    state["paused"] = True
+            viewed.clear()
+            viewed.wait(timeout=60)
+            continue
+        if paused:
+            # Resuming after a pause: start graphs fresh instead of joining
+            # across the gap. Peaks and totals carry on.
+            paused = False
+            with lock:
+                for c in state["clients"].values():
+                    c["hist"].clear()
+                state["paused"] = False
+            last_names = 0   # refresh names/limits right away
         try:
             if time.time() - last_names > 30:
                 refresh_names()
@@ -335,6 +368,7 @@ def snapshot():
                 "limit": state["limits"].get(ip), "blocked": ip in state["blocked"],
             })
         return {"clients": out, "updated": state["updated"], "error": state["error"],
+                "paused": state["paused"],
                 "sample": SAMPLE}
 
 
@@ -435,6 +469,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authed():
             return self.reply(401, b'{"error": "login required"}', "application/json")
         if path == "/api/stats":
+            mark_viewed()
             data = snapshot()
             data["auth"] = bool(auth)
             self.reply(200, json.dumps(data).encode(), "application/json")

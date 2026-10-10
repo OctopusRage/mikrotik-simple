@@ -29,7 +29,11 @@ key on the router with `/user ssh-keys import`).
 ## How it works
 
 - **Speeds:** every 2 s it runs `/tool torch` on the LAN bridge and sums the
-  per-flow rates by LAN client. Names come from DHCP leases (comment, then
+  per-flow rates by LAN client. Torch takes LAN traffic off the router's fast
+  path (on a hEX this cut peak download throughput by ~35%), so it only runs
+  while someone has the dashboard open: the page stops polling when its tab is
+  hidden, and the server stops torch 15 s after the last poll. Graphs and
+  totals therefore cover the time the page was open. Names come from DHCP leases (comment, then
   host-name) and ARP.
 - **Limit:** a simple queue `dash:<ip>` (`max-limit=up/down`). FastTrack skips
   queues, so limited clients go into the `dash-limited` address list and an
