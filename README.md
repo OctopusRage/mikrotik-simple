@@ -1,7 +1,7 @@
 # mikrotik-dash
 
 A small live dashboard for a MikroTik router: per-client download/upload speed,
-plus speed limits, blocking and name aliases. Python stdlib only, no router
+plus speed limits, blocking (optionally timed), client groups and name aliases. Python stdlib only, no router
 password needed — it talks to RouterOS over SSH.
 
 ## Run
@@ -39,11 +39,15 @@ key on the router with `/user ssh-keys import`).
   queues, so limited clients go into the `dash-limited` address list and an
   accept rule above the defconf fasttrack rule keeps them out of FastTrack.
 - **Block:** the `dash-blocked` address list plus drop rules at the top of the
-  forward chain.
+  forward chain. A timed block is an address-list entry with `timeout=`, so the
+  router lifts it by itself, even if the dashboard is down.
 - **Lease pinning:** limiting or blocking a client first makes its DHCP lease
   static, so it keeps the IP the rule applies to.
 - **Aliases:** stored locally in `aliases.json` (keyed by MAC) and mirrored to
   the static lease comment.
+- **Groups:** stored locally in `groups.json` (members keyed by MAC). Blocking or
+  limiting a group applies the same block or per-client limit to each member it
+  can currently find on the network; a limit is not shared across the group.
 
 Everything it creates on the router is commented `dash-limit`. Changing a limit
 or block drops the client's tracked connections so it takes effect at once.

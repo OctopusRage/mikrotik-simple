@@ -55,6 +55,16 @@
   .card { padding: 14px; margin-bottom: 16px; }
   .card h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
   .card h2 .seg { float: right; font-weight: 400; }
+  .card h2 .add { float: right; font-size: 12px; color: var(--down); }
+  .groups { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+  .groups .none { color: var(--muted); font-size: 13px; padding: 4px 0; }
+  .group { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+    transition: border-color .2s, background-color .2s; }
+  .group.on { border-color: var(--down); background: color-mix(in srgb, var(--down) 7%, transparent); }
+  .group button.gname { color: var(--text); font-weight: 600; font-size: 14px; padding: 0; }
+  .group button.gname:hover { color: var(--down); }
+  .group .gsub { font-size: 12px; color: var(--muted); margin: 2px 0 8px; }
+  .group .gact { display: flex; gap: 6px; flex-wrap: wrap; }
   .seg .n { opacity: .7; margin-left: 3px; }
   td.empty { text-align: center; color: var(--muted); padding: 18px 6px; white-space: normal; }
   .legend { font-size: 12px; color: var(--muted); font-weight: 400; }
@@ -123,7 +133,20 @@
     width: min(360px, 100%); box-shadow: 0 20px 60px rgb(0 0 0 / .3); animation: sheetIn .25s var(--ease); }
   @keyframes sheetIn { from { opacity: 0; transform: translateY(10px) scale(.97); } }
   @keyframes sheetOut { to { opacity: 0; transform: translateY(6px) scale(.98); } }
+  .sheet.wide { width: min(460px, 100%); }
   .sheet h3 { margin: 0 0 4px; font-size: 16px; }
+  .sheet select { width: 100%; font: inherit; padding: 8px 10px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .sheet .find { margin-bottom: 6px; }
+  .checklist { max-height: 260px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+  .sheet label.ck { display: flex; align-items: baseline; gap: 8px; margin: 0; padding: 6px 10px;
+    color: var(--text); font-size: 13px; cursor: pointer; border-bottom: 1px solid var(--line); }
+  .sheet label.ck:last-child { border-bottom: none; }
+  .sheet label.ck[hidden] { display: none; }
+  .sheet label.ck:hover { background: color-mix(in srgb, var(--down) 6%, transparent); }
+  .sheet label.ck input { width: auto; margin: 0; accent-color: var(--down); }
+  .sheet label.ck small { margin-left: auto; color: var(--muted); font-size: 11px; }
+  .sheet .count { float: right; font-weight: 400; }
   .sheet .sub { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
   .sheet label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
   .sheet input { width: 100%; font: inherit; padding: 8px 10px; border-radius: 8px;
@@ -188,6 +211,12 @@
   <div class="card">
     <h2>All clients, last 10 min while open <span class="legend"><span class="down">download</span><span class="up">upload</span></span></h2>
     <canvas id="total"></canvas>
+  </div>
+
+  <div class="card">
+    <h2>Groups <span class="legend">· block or limit several clients at once · click a name to list only its clients</span>
+      <button class="link add" id="newGroup">+ New group</button></h2>
+    <div class="groups" id="groups"></div>
   </div>
 
   <div class="card">
@@ -264,16 +293,31 @@ function toast(msg, isErr = false) {
 }
 
 // One reusable modal sheet. Resolves with the form values, or null on cancel.
-function modal({ title, sub = '', error = '', fields = [], hint = '', ok = 'Save', danger = false, extra = null }) {
+// Field types: text/number/password (default input), 'select' ({options:
+// [{value, label}]}) and 'checklist' ({items: [{value, label, sub, checked}]},
+// returned as an array). showIf: [otherField, value] shows a field only then.
+function fieldHTML(f) {
+  const show = f.showIf ? ` data-show-if="${esc(f.showIf.join('='))}"` : '';
+  const lab = `<label for="m_${f.name}">${esc(f.label)}</label>`;
+  if (f.type === 'select') return `<div${show}>${lab}<select id="m_${f.name}" name="${f.name}">${f.options.map(o =>
+    `<option value="${esc(o.value)}"${o.value === f.value ? ' selected' : ''}>${esc(o.label)}</option>`).join('')}</select></div>`;
+  if (f.type === 'checklist') return `<div${show}><label>${esc(f.label)} <span class="count"></span></label>
+    <input type="search" class="find" placeholder="Filter clients…">
+    <div class="checklist">${f.items.map(i => `<label class="ck"><input type="checkbox" name="${f.name}"
+      value="${esc(i.value)}"${i.checked ? ' checked' : ''}><span>${esc(i.label)}</span><small>${esc(i.sub || '')}</small></label>`).join('')}
+    </div></div>`;
+  return `<div${show}>${lab}<input id="m_${f.name}" name="${f.name}" type="${f.type || 'text'}" value="${esc(f.value ?? '')}"
+    placeholder="${esc(f.placeholder || '')}" ${f.type === 'number' ? 'min="0" step="any"' : ''}></div>`;
+}
+
+function modal({ title, sub = '', error = '', fields = [], hint = '', ok = 'Save', danger = false, extra = null, wide = false }) {
   return new Promise(resolve => {
     const bd = document.createElement('div');
     bd.className = 'backdrop';
-    bd.innerHTML = `<form class="sheet">
+    bd.innerHTML = `<form class="sheet${wide ? ' wide' : ''}">
       <h3>${esc(title)}</h3>${sub ? `<div class="sub">${esc(sub)}</div>` : ''}
       ${error ? `<div class="err" style="margin:4px 0 0">${esc(error)}</div>` : ''}
-      ${fields.map(f => `<label for="m_${f.name}">${esc(f.label)}</label>
-        <input id="m_${f.name}" name="${f.name}" type="${f.type || 'text'}" value="${esc(f.value ?? '')}"
-          placeholder="${esc(f.placeholder || '')}" ${f.type === 'number' ? 'min="0" step="any"' : ''}>`).join('')}
+      ${fields.map(fieldHTML).join('')}
       ${hint ? `<div class="hint">${esc(hint)}</div>` : ''}
       <div class="actions">
         ${extra ? `<button type="button" class="left" data-extra>${esc(extra)}</button>` : ''}
@@ -291,9 +335,30 @@ function modal({ title, sub = '', error = '', fields = [], hint = '', ok = 'Save
     bd.addEventListener('mousedown', e => { if (e.target === bd) close(null); });
     bd.querySelector('[data-cancel]').onclick = () => close(null);
     if (extra) bd.querySelector('[data-extra]').onclick = () => close({ extra: true });
-    bd.querySelector('form').onsubmit = e => {
+    const form = bd.querySelector('form');
+    const sync = () => {
+      form.querySelectorAll('[data-show-if]').forEach(el => {
+        const [n, v] = el.dataset.showIf.split('=');
+        el.hidden = form.elements[n].value !== v;
+      });
+      form.querySelectorAll('.checklist').forEach(l => {
+        const n = l.querySelectorAll('input:checked').length;
+        l.parentNode.querySelector('.count').textContent = n ? `${n} selected` : '';
+      });
+    };
+    form.addEventListener('change', sync);
+    form.addEventListener('input', e => {
+      if (!e.target.classList.contains('find')) return;
+      const q = e.target.value.toLowerCase();
+      e.target.parentNode.querySelectorAll('label.ck').forEach(l =>
+        l.hidden = !l.textContent.toLowerCase().includes(q));
+    });
+    sync();
+    form.onsubmit = e => {
       e.preventDefault();
-      close(Object.fromEntries(new FormData(e.target)));
+      const fd = new FormData(form), v = Object.fromEntries(fd);
+      for (const f of fields) if (f.type === 'checklist') v[f.name] = fd.getAll(f.name);
+      close(v);
     };
     document.body.appendChild(bd);
     (bd.querySelector('input') || bd.querySelector('button.primary')).focus();
@@ -374,7 +439,7 @@ let last = null, order = null, byName = true;
 let filter = 'active';
 try {
   const f = localStorage.getItem('filter');
-  if (['active', 'all', 'blocked'].includes(f)) filter = f;
+  if (['active', 'all', 'blocked'].includes(f) || f?.startsWith('group:')) filter = f;
   else if (localStorage.getItem('hideIdle') === '0') filter = 'all';  // old checkbox setting
 } catch {}
 // Active = moved traffic in the last 30 s (same rule that greys out a row).
@@ -389,6 +454,39 @@ const sorters = {
   peak_down: (a, b) => b.peak_down - a.peak_down, bytes_down: (a, b) => b.bytes_down - a.bytes_down,
 };
 const findClient = ip => last && last.clients.find(c => c.ip === ip);
+const fmtLeft = s => s >= 3600 ? `${Math.floor(s / 3600)}h ${String(Math.floor(s % 3600 / 60)).padStart(2, '0')}m left`
+  : s >= 60 ? `${Math.ceil(s / 60)}m left` : `${Math.max(0, Math.round(s))}s left`;
+const fmtMins = m => m % 60 ? `${m} min` : m === 60 ? '1 hour' : `${m / 60} hours`;
+const MAX_BLOCK_MIN = 7 * 24 * 60;
+const DURATIONS = [['0', 'Until I unblock'], ['15', '15 minutes'], ['30', '30 minutes'], ['60', '1 hour'],
+  ['120', '2 hours'], ['240', '4 hours'], ['480', '8 hours'], ['custom', 'Custom…']];
+
+// Block dialog with a duration. Returns minutes (0 = until unblocked) or null.
+async function blockDialog(title, sub, hint) {
+  let error = '', v = { dur: '0', mins: '' };
+  for (;;) {
+    v = await modal({ title, sub, hint, error, ok: 'Block', danger: true, fields: [
+      { name: 'dur', label: 'Block for', type: 'select', value: v.dur, options: DURATIONS.map(([value, label]) => ({ value, label })) },
+      { name: 'mins', label: 'Minutes', type: 'number', value: v.mins, placeholder: 'e.g. 45', showIf: ['dur', 'custom'] }] });
+    if (!v) return null;
+    const m = v.dur === 'custom' ? Math.round(+v.mins) : +v.dur;
+    if (m >= 0 && m <= MAX_BLOCK_MIN && (v.dur !== 'custom' || m > 0)) return m;
+    error = `Enter 1 to ${MAX_BLOCK_MIN} minutes (7 days).`;
+  }
+}
+
+// Limit dialog in the unit being shown. Returns {remove: true}, {down, up} in bps, or null.
+async function limitDialog(title, sub, current, removable, hint) {
+  const u = limUnit(), cur = bps => bps ? +(bps / u.bps).toFixed(3) : '';
+  const v = await modal({ title, sub, hint,
+    fields: [
+      { name: 'down', label: `Max download (${u.name})`, type: 'number', value: cur(current?.down), placeholder: '0 = unlimited' },
+      { name: 'up', label: `Max upload (${u.name})`, type: 'number', value: cur(current?.up), placeholder: '0 = unlimited' }],
+    extra: removable ? 'Remove limit' : null });
+  if (!v) return null;
+  if (v.extra) return { remove: true };
+  return { down: (+v.down || 0) * u.bps, up: (+v.up || 0) * u.bps };
+}
 const label = c => c.name ? `${c.name} (${c.ip})` : c.ip;
 
 async function tick() {
@@ -422,7 +520,7 @@ async function control(body, btn) {
     const j = await r.json();
     if (!j.ok) throw new Error(j.error);
     await tick();
-    return true;
+    return j;
   } catch (e) {
     toast('Failed: ' + e.message, true);
     return false;
@@ -490,8 +588,32 @@ function render(d) {
   // Blocked / limited clients stay visible so their controls are reachable.
   const nBlocked = all.filter(c => c.blocked).length;
   $('nblocked').textContent = nBlocked ? nBlocked : '';
-  const clients = filter === 'blocked' ? all.filter(c => c.blocked)
+  const groups = d.groups || [];
+  let grp = null;
+  if (filter.startsWith('group:')) {
+    grp = groups.find(g => 'group:' + g.id === filter);
+    if (!grp) { filter = 'active'; showFilter(); }
+  }
+  const clients = grp ? all.filter(c => grp.members.includes(c.ip))
+    : filter === 'blocked' ? all.filter(c => c.blocked)
     : filter === 'active' ? all.filter(c => isActive(c) || c.blocked || c.limit) : all;
+  const groupsOf = new Map();
+  for (const g of groups) for (const ip of g.members) groupsOf.set(ip, [...(groupsOf.get(ip) || []), g.name]);
+
+  setHTML($('groups'), groups.map(g => {
+    const mem = g.members.map(ip => byIp.get(ip)).filter(Boolean);
+    const nb = mem.filter(c => c.blocked).length, nl = mem.filter(c => c.limit).length;
+    const na = mem.filter(isActive).length;
+    const info = [`${g.members.length} client${g.members.length === 1 ? '' : 's'}`, na && `${na} active`,
+      nb && `${nb} blocked`, nl && `${nl} limited`, g.missing && `${g.missing} not seen`].filter(Boolean).join(' · ');
+    return `<div class="group${grp === g ? ' on' : ''}" data-gid="${esc(g.id)}">
+      <button class="link gname" data-gact="show" title="List only this group's clients">${esc(g.name)}</button>
+      <button class="link" data-gact="edit" title="Edit group">✎</button>
+      <div class="gsub">${info}</div>
+      <div class="gact"><button data-gact="block" class="danger">Block</button>
+        ${nb ? '<button data-gact="unblock">Unblock</button>' : ''}
+        <button data-gact="limit">${nl ? 'Edit limit' : 'Limit'}</button></div></div>`;
+  }).join('') || '<div class="none">No groups yet. Make one to block or limit several clients at once.</div>');
 
   // Tiles
   tween($('tdown'), all.reduce((s, c) => s + c.down, 0), fmtRate);
@@ -531,7 +653,8 @@ function render(d) {
     tr.classList.toggle('blocked', c.blocked);
     tr.classList.toggle('idle', !c.blocked && !isActive(c));
     const td = tr.children;
-    const sub = [c.ip, c.mac, c.alias && c.host && c.host !== c.alias ? c.host : ''].filter(Boolean).join(' · ');
+    const sub = [c.ip, c.mac, c.alias && c.host && c.host !== c.alias ? c.host : '',
+      ...(groupsOf.get(c.ip) || []).map(n => '⧉ ' + n)].filter(Boolean).join(' · ');
     setHTML(td[0], `<div>${esc(c.name || '(unknown)')} <button class="link" data-act="alias" data-ip="${c.ip}" title="Rename">✎</button>`
       + `${c.static ? '<span class="badge st" title="Static DHCP lease: keeps this IP">static</span>' : ''}</div>`
       + `<div class="sub">${esc(sub)}</div>`);
@@ -539,7 +662,9 @@ function render(d) {
     tween(td[2].firstChild, c.up, fmtRate);
     setHTML(td[4], `${fmtRate(c.peak_down)}<div class="sub">${fmtRate(c.peak_up)}</div>`);
     setHTML(td[5], `${fmtBytes(c.bytes_down)}<div class="sub">${fmtBytes(c.bytes_up)}</div>`);
-    setHTML(td[6], `${c.blocked ? '<span class="badge blk">blocked</span>' : ''}${c.limit ?
+    setHTML(td[6], `${c.blocked ? `<span class="badge blk"${c.block_left != null
+        ? ` title="Unblocks by itself at ${new Date(Date.now() + c.block_left * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}"` : ''}>blocked${
+        c.block_left != null ? ' · ' + fmtLeft(c.block_left) : ''}</span>` : ''}${c.limit ?
         `<span class="badge lim">↓${fmtLim(c.limit.down)} ↑${fmtLim(c.limit.up)}</span>` : ''}
         <button data-act="limit" data-ip="${c.ip}">${c.limit ? 'Edit limit' : 'Limit'}</button>
         <button data-act="${c.blocked ? 'unblock' : 'block'}" data-ip="${c.ip}" class="${c.blocked ? '' : 'danger'}">${c.blocked ? 'Unblock' : 'Block'}</button>`);
@@ -560,7 +685,8 @@ function render(d) {
       empty = document.createElement('tr'); empty.id = 'emptyRow';
       empty.innerHTML = `<td class="empty" colspan="7"></td>`;
     }
-    empty.firstChild.textContent = filter === 'blocked' ? 'No blocked clients'
+    empty.firstChild.textContent = grp ? 'This group has no clients the router knows right now'
+      : filter === 'blocked' ? 'No blocked clients'
       : all.length ? `No active clients right now · ${all.length} inactive hidden` : 'No clients yet';
     tb.appendChild(empty);
   } else if (empty) empty.remove();
@@ -596,6 +722,78 @@ $('units').onclick = e => {
   if (last) render(last);
 };
 
+// ---------------------------------------------------------------------------
+// Groups
+async function groupDialog(g) {
+  const items = last.clients.slice().sort(byLabel).map(c => ({ value: c.ip, label: c.name || c.ip,
+    sub: c.name ? c.ip : c.mac, checked: !!g && g.members.includes(c.ip) }));
+  let error = '', name = g?.name || '', picked = null;
+  for (;;) {
+    if (picked) items.forEach(i => i.checked = picked.includes(i.value));
+    const v = await modal({ title: g ? 'Edit group' : 'New group', wide: true, error, ok: g ? 'Save' : 'Create',
+      fields: [{ name: 'name', label: 'Name', value: name, placeholder: 'e.g. Kids' },
+               { name: 'ips', label: 'Clients', type: 'checklist', items }],
+      hint: 'Members are remembered by MAC address, so they stay in the group if their IP changes.'
+        + (g ? ' Deleting the group leaves its clients’ blocks and limits as they are.' : ''),
+      extra: g ? 'Delete group' : null });
+    if (!v) return;
+    if (v.extra) {
+      const ok = await modal({ title: `Delete group “${g.name}”?`, ok: 'Delete', danger: true,
+        hint: 'Only the group goes. Its clients keep any block or limit they have now.' });
+      if (ok && await control({ action: 'group_delete', id: g.id })) toast(`Deleted group ${g.name}`);
+      return;
+    }
+    name = v.name.trim(); picked = v.ips;
+    if (!name) { error = 'Give the group a name.'; continue; }
+    if (await control({ action: 'group_save', id: g?.id || '', name, ips: v.ips }))
+      toast(g ? `Saved ${name}` : `Created group ${name} with ${v.ips.length} client${v.ips.length === 1 ? '' : 's'}`);
+    return;
+  }
+}
+
+$('newGroup').onclick = () => last && groupDialog(null);
+
+$('groups').addEventListener('click', async e => {
+  const b = e.target.closest('[data-gact]'); if (!b || !last) return;
+  const g = (last.groups || []).find(x => x.id === b.closest('.group').dataset.gid); if (!g) return;
+  const act = b.dataset.gact, n = g.members.length;
+  const skipped = j => j.skipped ? ` · ${j.skipped} not seen on the network, skipped` : '';
+  const plural = k => `${k} client${k === 1 ? '' : 's'}`;
+
+  if (act === 'show') {
+    filter = filter === 'group:' + g.id ? 'active' : 'group:' + g.id;
+    try { localStorage.setItem('filter', filter); } catch {}
+    showFilter();
+    render(last);
+
+  } else if (act === 'edit') {
+    groupDialog(g);
+
+  } else if (act === 'block') {
+    const m = await blockDialog(`Block group “${g.name}”?`, plural(n),
+      'Cuts internet for every client in the group right away. Their DHCP leases are made static. '
+      + 'A timed block is lifted by the router itself, even if this dashboard is off.');
+    if (m === null) return;
+    const j = await control({ action: 'group', id: g.id, op: 'block', minutes: m }, b);
+    if (j) toast(`Blocked ${plural(j.done)} in ${g.name}${m ? ' for ' + fmtMins(m) : ''}${skipped(j)}`);
+
+  } else if (act === 'unblock') {
+    const j = await control({ action: 'group', id: g.id, op: 'unblock' }, b);
+    if (j) toast(`Unblocked ${g.name}${skipped(j)}`);
+
+  } else if (act === 'limit') {
+    const lims = g.members.map(ip => findClient(ip)?.limit);
+    const same = lims.every(l => JSON.stringify(l) === JSON.stringify(lims[0])) ? lims[0] : null;
+    const v = await limitDialog(`Limit group “${g.name}”`, plural(n), same, lims.some(Boolean),
+      'Each client in the group gets this limit on its own (it is not shared). Their DHCP leases are made static.');
+    if (!v) return;
+    const off = v.remove || !(v.down || v.up);
+    const j = await control({ action: 'group', id: g.id, op: off ? 'unlimit' : 'limit',
+      down_mbps: v.down / 1e6 || 0, up_mbps: v.up / 1e6 || 0 }, b);
+    if (j) toast((off ? `Limits removed for ${g.name}` : `Limited ${plural(j.done)} in ${g.name} to ↓${fmtLim(v.down)} ↑${fmtLim(v.up)}`) + skipped(j));
+  }
+});
+
 const showFilter = () => document.querySelectorAll('#filter button')
   .forEach(b => b.classList.toggle('on', b.dataset.f === filter));
 showFilter();
@@ -620,27 +818,21 @@ $('rows').addEventListener('click', async e => {
       toast(v.alias ? `Renamed to ${v.alias}` : 'Name cleared');
 
   } else if (b.dataset.act === 'limit') {
-    const u = limUnit(), cur = bps => bps ? +(bps / u.bps).toFixed(3) : '';
-    const v = await modal({ title: 'Limit speed', sub: label(c),
-      fields: [
-        { name: 'down', label: `Max download (${u.name})`, type: 'number', value: cur(c.limit?.down), placeholder: '0 = unlimited' },
-        { name: 'up', label: `Max upload (${u.name})`, type: 'number', value: cur(c.limit?.up), placeholder: '0 = unlimited' }],
-      hint: 'Applied as a MikroTik simple queue. The client’s DHCP lease is made static so it keeps this IP.',
-      extra: c.limit ? 'Remove limit' : null });
+    const v = await limitDialog('Limit speed', label(c), c.limit, !!c.limit,
+      'Applied as a MikroTik simple queue. The client’s DHCP lease is made static so it keeps this IP.');
     if (!v) return;
-    if (v.extra) {
+    if (v.remove) {
       if (await control({ action: 'unlimit', ip }, b)) toast(`Limit removed for ${c.name || ip}`);
-    } else {
-      const down = (+v.down || 0) * u.bps, up = (+v.up || 0) * u.bps;
-      if (await control({ action: 'limit', ip, down_mbps: down / 1e6, up_mbps: up / 1e6 }, b))
-        toast(down || up ? `Limited ${c.name || ip} to ↓${fmtLim(down)} ↑${fmtLim(up)}` : `Limit removed for ${c.name || ip}`);
+    } else if (await control({ action: 'limit', ip, down_mbps: v.down / 1e6, up_mbps: v.up / 1e6 }, b)) {
+      toast(v.down || v.up ? `Limited ${c.name || ip} to ↓${fmtLim(v.down)} ↑${fmtLim(v.up)}` : `Limit removed for ${c.name || ip}`);
     }
 
   } else if (b.dataset.act === 'block') {
-    const v = await modal({ title: 'Block client?', sub: label(c),
-      hint: 'Cuts its internet access right away. Its DHCP lease is made static so it keeps this IP.',
-      ok: 'Block', danger: true });
-    if (v && await control({ action: 'block', ip }, b)) toast(`Blocked ${c.name || ip}`);
+    const m = await blockDialog('Block client?', label(c),
+      'Cuts its internet access right away. Its DHCP lease is made static so it keeps this IP. '
+      + 'A timed block is lifted by the router itself, even if this dashboard is off.');
+    if (m !== null && await control({ action: 'block', ip, minutes: m }, b))
+      toast(`Blocked ${c.name || ip}${m ? ' for ' + fmtMins(m) : ''}`);
 
   } else if (b.dataset.act === 'unblock') {
     if (await control({ action: 'unblock', ip }, b)) toast(`Unblocked ${c.name || ip}`);

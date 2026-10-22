@@ -14,13 +14,13 @@ Configured by environment variables (defaults in brackets):
   LAN_CIDR        LAN subnet                              [192.168.88.0/24]
   ROUTER_IP       router's LAN IP (excluded)              [192.168.88.1]
   STATIC_NAMES    JSON {ip: name} for lease-less clients  [{}]
-  DATA_DIR        where aliases.json lives                [script dir]
+  DATA_DIR        where aliases.json / groups.json live   [script dir]
   BIND, PORT      listen address                          [127.0.0.1, 8088]
   DASH_PASSWORD   initial login password; can be changed  [] (no login)
                   in the dashboard, changing it here resets that
   SSH_KNOWN_HOSTS known_hosts file; auto-accepts new keys []
 """
-import argparse, hashlib, hmac, ipaddress, json, os, re, subprocess, threading, time
+import argparse, hashlib, hmac, ipaddress, json, os, re, secrets, subprocess, threading, time
 from collections import deque
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -40,6 +40,8 @@ STATIC_NAMES = json.loads(env("STATIC_NAMES") or "{}")
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = env("DATA_DIR", HERE)
 ALIASES = os.path.join(DATA_DIR, "aliases.json")   # {MAC or "ip:<ip>": alias}
+GROUPS = os.path.join(DATA_DIR, "groups.json")     # [{id, name, members: [MAC or "ip:<ip>"]}]
+MAX_BLOCK_MIN = 7 * 24 * 60                        # longest temporary block
 CTL = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", f"mikrotik-dash-{os.getuid()}.sock")
 SSH_OPTS = ["-o", "LogLevel=ERROR", "-o", "BatchMode=yes",
             "-o", "ControlMaster=auto", "-o", f"ControlPath={CTL}", "-o", "ControlPersist=10m"]
@@ -54,7 +56,7 @@ if env("SSH_KNOWN_HOSTS"):   # e.g. a writable file in the container's data volu
                  "-o", "StrictHostKeyChecking=accept-new"]
 
 lock = threading.Lock()
-state = {"clients": {}, "names": {}, "limits": {}, "blocked": set(), "paused": True, "updated": 0, "error": None, "wan": None}
+state = {"clients": {}, "names": {}, "limits": {}, "blocked": set(), "block_until": {}, "paused": True, "updated": 0, "error": None, "wan": None}
 
 
 def ros(cmd, timeout=20):
@@ -153,7 +155,7 @@ def flush_conns(ip):
             f'or dst-address~"^{ip}:"]')
 
 
-def set_limit(ip, down_bps, up_bps):
+def set_limit(ip, down_bps, up_bps, refresh=True):
     ensure_rules()
     if down_bps or up_bps:
         pin_lease(ip)
@@ -171,19 +173,35 @@ def set_limit(ip, down_bps, up_bps):
             flush_conns(ip),
         ]
     ros("; ".join(cmds))
-    refresh_controls()
+    if refresh:
+        refresh_controls()
 
 
-def set_block(ip, blocked):
+def set_block(ip, blocked, minutes=0, refresh=True):
+    """Block (or unblock) ip. With minutes, the router drops the address-list
+    entry by itself when the time is up, even if this dashboard is down."""
     ensure_rules()
     if blocked:
         pin_lease(ip)
     cmds = [f'/ip firewall address-list remove [find where list={BLOCK_LIST} address={ip}]']
     if blocked:
-        cmds += [f'/ip firewall address-list add list={BLOCK_LIST} address={ip} comment="{TAG}"',
+        timeout = f" timeout={int(minutes)}m" if minutes else ""
+        cmds += [f'/ip firewall address-list add list={BLOCK_LIST} address={ip} comment="{TAG}"{timeout}',
                  flush_conns(ip)]
     ros("; ".join(cmds))
-    refresh_controls()
+    if refresh:
+        refresh_controls()
+
+
+def parse_duration(v):
+    """RouterOS duration ('00:10:00', '1d02:00:00', '2w3d', '5m30s') → seconds."""
+    total = 0
+    for n, unit in re.findall(r"(\d+)([wdhms])", v or ""):
+        total += int(n) * {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1}[unit]
+    m = re.search(r"(\d+):(\d+):(\d+)$", v or "")
+    if m:
+        total += int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3])
+    return total
 
 
 def parse_rate(v):
@@ -194,7 +212,7 @@ def parse_rate(v):
 
 
 def refresh_controls():
-    limits, blocked = {}, set()
+    limits, blocked, until = {}, set(), {}
     for r in parse_as_value(ros(
             f':put [/queue simple print as-value where comment="{TAG}"]')):
         ip = r.get("target", "").split("/")[0]
@@ -203,8 +221,10 @@ def refresh_controls():
     for r in parse_as_value(ros(
             f':put [/ip firewall address-list print as-value where list={BLOCK_LIST}]')):
         blocked.add(r.get("address", ""))
+        if r.get("timeout"):
+            until[r.get("address", "")] = time.time() + parse_duration(r["timeout"])
     with lock:
-        state["limits"], state["blocked"] = limits, blocked
+        state["limits"], state["blocked"], state["block_until"] = limits, blocked, until
 
 
 def load_aliases():
@@ -242,10 +262,7 @@ def set_alias(ip, alias):
             aliases[key] = alias
         else:
             aliases.pop(key, None)
-        tmp = ALIASES + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(aliases, f, indent=2, sort_keys=True)
-        os.replace(tmp, ALIASES)
+        save_json(ALIASES, aliases)
     # Mirror onto a static lease's comment so Winbox shows it too.
     ros(f'/ip dhcp-server lease set [find where address="{ip}" !dynamic] '
         f'comment="{ros_str(alias)}"')
@@ -261,6 +278,86 @@ def pin_lease(ip):
         cmds.append(f'/ip dhcp-server lease set [find where address="{ip}" comment=""] '
                     f'comment="{ros_str(name)}"')
     ros("; ".join(cmds))
+
+
+def save_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def load_groups():
+    try:
+        with open(GROUPS) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return []
+
+
+groups = load_groups()
+
+
+def member_ips(g):
+    """Current IPs of a group's members (call with lock held). Members are kept
+    by MAC like aliases, so they follow a device across IP changes."""
+    ip_of = {f"ip:{ip}": ip for ip in state["names"]}
+    ip_of.update({n["mac"].upper(): ip for ip, n in state["names"].items() if n.get("mac")})
+    return [ip_of.get(k) or (k[3:] if k.startswith("ip:") else None) for k in g["members"]]
+
+
+def save_group(gid, name, ips):
+    name = name.strip()[:40]
+    if not name:
+        raise ValueError("group needs a name")
+    for ip in ips:
+        if not lan_ip(ip):
+            raise ValueError(f"not a LAN client IP: {ip}")
+    with lock:
+        members = list(dict.fromkeys(alias_key(ip) for ip in ips))
+        g = next((g for g in groups if g["id"] == gid), None) if gid else None
+        if gid and not g:
+            raise ValueError("no such group")
+        if not g:
+            g = {"id": secrets.token_hex(4)}
+            groups.append(g)
+        g.update(name=name, members=members)
+        save_json(GROUPS, groups)
+
+
+def delete_group(gid):
+    with lock:
+        groups[:] = [g for g in groups if g["id"] != gid]
+        save_json(GROUPS, groups)
+
+
+def group_action(gid, op, minutes=0, down=0, up=0):
+    """Apply one control to every member that has a known IP right now.
+    Returns (done, skipped)."""
+    with lock:
+        g = next((g for g in groups if g["id"] == gid), None)
+        if not g:
+            raise ValueError("no such group")
+        ips = member_ips(g)
+    apply = {
+        "block": lambda ip: set_block(ip, True, minutes, refresh=False),
+        "unblock": lambda ip: set_block(ip, False, refresh=False),
+        "limit": lambda ip: set_limit(ip, down, up, refresh=False),
+        "unlimit": lambda ip: set_limit(ip, 0, 0, refresh=False),
+    }.get(op)
+    if not apply:
+        raise ValueError("unknown group action")
+    done = [ip for ip in ips if ip]
+    errors = []
+    for ip in done:
+        try:
+            apply(ip)
+        except Exception as e:  # keep going; report at the end
+            errors.append(f"{ip}: {e}")
+    refresh_controls()
+    if errors:
+        raise RuntimeError(f"{len(errors)} of {len(done)} failed — " + "; ".join(errors[:3]))
+    return len(done), len(ips) - len(done)
 
 
 def sample():
@@ -323,7 +420,9 @@ def poller():
                 state["paused"] = False
             last_names = 0   # refresh names/limits right away
         try:
-            if time.time() - last_names > 30:
+            with lock:
+                expired = any(t < time.time() for t in state["block_until"].values())
+            if time.time() - last_names > 30 or expired:
                 refresh_names()
                 refresh_controls()
                 last_names = time.time()
@@ -367,8 +466,13 @@ def snapshot():
                 "bytes_down": c["bytes_down"], "bytes_up": c["bytes_up"],
                 "last_active": c["last_active"], "hist": h,
                 "limit": state["limits"].get(ip), "blocked": ip in state["blocked"],
+                # Seconds until a timed block runs out (None = until unblocked).
+                "block_left": max(0, round(state["block_until"][ip] - time.time()))
+                              if ip in state["block_until"] else None,
             })
-        return {"clients": out, "updated": state["updated"], "error": state["error"],
+        grp = [{"id": g["id"], "name": g["name"], "members": [ip for ip in member_ips(g) if ip],
+                "missing": sum(1 for ip in member_ips(g) if not ip)} for g in groups]
+        return {"clients": out, "groups": grp, "updated": state["updated"], "error": state["error"],
                 "paused": state["paused"],
                 "sample": SAMPLE}
 
@@ -522,25 +626,38 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_error(415)
         try:
             req = json.loads(raw)
+            action = req.get("action")
+            down = int(float(req.get("down_mbps") or 0) * 1e6)
+            up = int(float(req.get("up_mbps") or 0) * 1e6)
+            minutes = int(float(req.get("minutes") or 0))
+            if down < 0 or up < 0 or not 0 <= minutes <= MAX_BLOCK_MIN:
+                raise ValueError("value out of range")
+            body = {"ok": True}
+            if action == "group_save":
+                save_group(str(req.get("id") or ""), str(req.get("name", "")),
+                           [str(ip) for ip in req.get("ips") or []])
+                return self.reply(200, json.dumps(body).encode(), "application/json")
+            if action == "group_delete":
+                delete_group(str(req.get("id", "")))
+                return self.reply(200, json.dumps(body).encode(), "application/json")
+            if action == "group":
+                body["done"], body["skipped"] = group_action(
+                    str(req.get("id", "")), req.get("op"), minutes, down, up)
+                return self.reply(200, json.dumps(body).encode(), "application/json")
             ip = str(req.get("ip", ""))
             if not lan_ip(ip):
                 raise ValueError("not a LAN client IP")
-            action = req.get("action")
             if action == "limit":
-                down = int(float(req.get("down_mbps") or 0) * 1e6)
-                up = int(float(req.get("up_mbps") or 0) * 1e6)
-                if down < 0 or up < 0:
-                    raise ValueError("negative rate")
                 set_limit(ip, down, up)
             elif action == "unlimit":
                 set_limit(ip, 0, 0)
             elif action == "alias":
                 set_alias(ip, str(req.get("alias", "")))
             elif action in ("block", "unblock"):
-                set_block(ip, action == "block")
+                set_block(ip, action == "block", minutes)
             else:
                 raise ValueError("unknown action")
-            code, body = 200, {"ok": True}
+            code = 200
         except Exception as e:
             code, body = 400, {"ok": False, "error": str(e)}
         self.reply(code, json.dumps(body).encode(), "application/json")
