@@ -54,8 +54,8 @@
   .down { color: var(--down); } .up { color: var(--up); }
   .card { padding: 14px; margin-bottom: 16px; }
   .card h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
-  .card h2 .opt { float: right; font-weight: 400; cursor: pointer; user-select: none; }
-  .card h2 .opt input { vertical-align: -2px; margin: 0 4px 0 0; accent-color: var(--down); }
+  .card h2 .seg { float: right; font-weight: 400; }
+  .seg .n { opacity: .7; margin-left: 3px; }
   td.empty { text-align: center; color: var(--muted); padding: 18px 6px; white-space: normal; }
   .legend { font-size: 12px; color: var(--muted); font-weight: 400; }
   .legend .down::before, .legend .up::before { content: ""; display: inline-block; width: 10px; height: 3px;
@@ -191,7 +191,7 @@
   </div>
 
   <div class="card">
-    <h2>Per client <label class="opt"><input type="checkbox" id="hideIdle" checked>Hide inactive</label>
+    <h2>Per client <span class="seg" id="filter" title="Which clients to list"><button data-f="active">Active</button><button data-f="all">All</button><button data-f="blocked">Blocked<span class="n" id="nblocked"></span></button></span>
       <span class="legend">· active first, then by name · click a column to sort · sampled every <span id="sample">2</span>s, only while this page is open · totals cover that time</span></h2>
     <div class="tablewrap">
       <table>
@@ -370,9 +370,13 @@ $('logout').onclick = async () => {
 // ---------------------------------------------------------------------------
 // Data
 let last = null, order = null, byName = true;
-let hideIdle = true;
-try { hideIdle = localStorage.getItem('hideIdle') !== '0'; } catch {}
-$('hideIdle').checked = hideIdle;
+// Row filter: 'active' (default), 'all', or 'blocked' (offline ones included).
+let filter = 'active';
+try {
+  const f = localStorage.getItem('filter');
+  if (['active', 'all', 'blocked'].includes(f)) filter = f;
+  else if (localStorage.getItem('hideIdle') === '0') filter = 'all';  // old checkbox setting
+} catch {}
 // Active = moved traffic in the last 30 s (same rule that greys out a row).
 const isActive = c => Date.now() / 1000 - c.last_active < 30;
 const ipCmp = (a, b) => a.localeCompare(b, undefined, { numeric: true });
@@ -484,7 +488,10 @@ function render(d) {
   const all = order.map(ip => byIp.get(ip));
   if (byName) order = null;
   // Blocked / limited clients stay visible so their controls are reachable.
-  const clients = hideIdle ? all.filter(c => isActive(c) || c.blocked || c.limit) : all;
+  const nBlocked = all.filter(c => c.blocked).length;
+  $('nblocked').textContent = nBlocked ? nBlocked : '';
+  const clients = filter === 'blocked' ? all.filter(c => c.blocked)
+    : filter === 'active' ? all.filter(c => isActive(c) || c.blocked || c.limit) : all;
 
   // Tiles
   tween($('tdown'), all.reduce((s, c) => s + c.down, 0), fmtRate);
@@ -553,8 +560,8 @@ function render(d) {
       empty = document.createElement('tr'); empty.id = 'emptyRow';
       empty.innerHTML = `<td class="empty" colspan="7"></td>`;
     }
-    empty.firstChild.textContent = all.length
-      ? `No active clients right now · ${all.length} inactive hidden` : 'No clients yet';
+    empty.firstChild.textContent = filter === 'blocked' ? 'No blocked clients'
+      : all.length ? `No active clients right now · ${all.length} inactive hidden` : 'No clients yet';
     tb.appendChild(empty);
   } else if (empty) empty.remove();
   if (reduced) return;
@@ -589,9 +596,14 @@ $('units').onclick = e => {
   if (last) render(last);
 };
 
-$('hideIdle').onchange = e => {
-  hideIdle = e.target.checked;
-  try { localStorage.setItem('hideIdle', hideIdle ? '1' : '0'); } catch {}
+const showFilter = () => document.querySelectorAll('#filter button')
+  .forEach(b => b.classList.toggle('on', b.dataset.f === filter));
+showFilter();
+$('filter').onclick = e => {
+  const b = e.target.closest('button'); if (!b || b.dataset.f === filter) return;
+  filter = b.dataset.f;
+  try { localStorage.setItem('filter', filter); } catch {}
+  showFilter();
   if (last) render(last);
 };
 

@@ -99,7 +99,8 @@ def refresh_names():
     static_ids = set(ros(":put [/ip dhcp-server lease find where !dynamic]").strip().split(";"))
     for r in parse_as_value(ros(":put [/ip dhcp-server lease print as-value]")):
         a = r.get("address", "")
-        if lan_ip(a) and r.get("status") == "bound":
+        # Static leases count even when offline, so a blocked device keeps its name.
+        if lan_ip(a) and (r.get("status") == "bound" or r.get(".id") in static_ids):
             e = names.setdefault(a, {"mac": r.get("mac-address", ""), "name": ""})
             e["name"] = r.get("comment") or r.get("host-name") or e["name"]
             e["host"] = r.get("host-name", "")
