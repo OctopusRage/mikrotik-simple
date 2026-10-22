@@ -1,7 +1,7 @@
 # mikrotik-dash
 
 A small live dashboard for a MikroTik router: per-client download/upload speed,
-plus speed limits, blocking (optionally timed), client groups and name aliases. Python stdlib only, no router
+plus speed limits, blocking (timed or scheduled), client groups and name aliases. Python stdlib only, no router
 password needed — it talks to RouterOS over SSH.
 
 ## Run
@@ -48,6 +48,12 @@ key on the router with `/user ssh-keys import`).
 - **Groups:** stored locally in `groups.json` (members keyed by MAC). Blocking or
   limiting a group applies the same block or per-client limit to each member it
   can currently find on the network; a limit is not shared across the group.
+- **Scheduled blocks:** a sleep timer ("in 30 min"), a one-off time, or a
+  repeating window on chosen days ("weekdays 21:00–06:30"), stored in
+  `schedules.json`. RouterOS device-mode blocks `/system scheduler` by default,
+  so the dashboard starts them (checked every 15 s, in the router's timezone);
+  each start is a timed block, so the router still ends it on time. A start
+  missed while the dashboard was down is applied late for whatever time is left.
 
 Everything it creates on the router is commented `dash-limit`. Changing a limit
 or block drops the client's tracked connections so it takes effect at once.

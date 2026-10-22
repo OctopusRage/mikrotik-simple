@@ -65,6 +65,10 @@
   .group button.gname:hover { color: var(--down); }
   .group .gsub { font-size: 12px; color: var(--muted); margin: 2px 0 8px; }
   .group .gact { display: flex; gap: 6px; flex-wrap: wrap; }
+  .sched { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .sched:last-child { border-bottom: none; }
+  .sched .what { flex: 1; min-width: 0; }
+  .sched .sub { color: var(--muted); font-size: 12px; }
   .seg .n { opacity: .7; margin-left: 3px; }
   td.empty { text-align: center; color: var(--muted); padding: 18px 6px; white-space: normal; }
   .legend { font-size: 12px; color: var(--muted); font-weight: 400; }
@@ -147,6 +151,13 @@
   .sheet label.ck input { width: auto; margin: 0; accent-color: var(--down); }
   .sheet label.ck small { margin-left: auto; color: var(--muted); font-size: 11px; }
   .sheet .count { float: right; font-weight: 400; }
+  .days { display: flex; gap: 4px; flex-wrap: wrap; }
+  .sheet label.day { margin: 0; position: relative; cursor: pointer; }
+  .sheet label.day input { position: absolute; opacity: 0; width: auto; }
+  .sheet label.day span { display: inline-block; padding: 5px 9px; border-radius: 7px; font-size: 12px;
+    border: 1px solid var(--line); color: var(--muted); transition: background-color .15s, color .15s; }
+  .sheet label.day input:checked + span { background: var(--text); border-color: var(--text); color: var(--bg); }
+  .sheet label.day input:focus-visible + span { outline: 2px solid var(--down); }
   .sheet .sub { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
   .sheet label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
   .sheet input { width: 100%; font: inherit; padding: 8px 10px; border-radius: 8px;
@@ -217,6 +228,11 @@
     <h2>Groups <span class="legend">· block or limit several clients at once · click a name to list only its clients</span>
       <button class="link add" id="newGroup">+ New group</button></h2>
     <div class="groups" id="groups"></div>
+  </div>
+
+  <div class="card" id="schedCard" hidden>
+    <h2>Scheduled blocks <span class="legend">· started by this dashboard at the set time; the router ends each block on time</span></h2>
+    <div id="scheds"></div>
   </div>
 
   <div class="card">
@@ -295,12 +311,16 @@ function toast(msg, isErr = false) {
 // One reusable modal sheet. Resolves with the form values, or null on cancel.
 // Field types: text/number/password (default input), 'select' ({options:
 // [{value, label}]}) and 'checklist' ({items: [{value, label, sub, checked}]},
-// returned as an array). showIf: [otherField, value] shows a field only then.
+// returned as an array), 'days' (weekday toggles, array of 0=Mon..6). showIf:
+// [otherField, 'a|b'] shows a field only while otherField is one of those.
+const DAYN = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 function fieldHTML(f) {
   const show = f.showIf ? ` data-show-if="${esc(f.showIf.join('='))}"` : '';
   const lab = `<label for="m_${f.name}">${esc(f.label)}</label>`;
   if (f.type === 'select') return `<div${show}>${lab}<select id="m_${f.name}" name="${f.name}">${f.options.map(o =>
     `<option value="${esc(o.value)}"${o.value === f.value ? ' selected' : ''}>${esc(o.label)}</option>`).join('')}</select></div>`;
+  if (f.type === 'days') return `<div${show}>${lab}<div class="days">${DAYN.map((n, i) =>
+    `<label class="day"><input type="checkbox" name="${f.name}" value="${i}"${f.value.includes(i) ? ' checked' : ''}><span>${n}</span></label>`).join('')}</div></div>`;
   if (f.type === 'checklist') return `<div${show}><label>${esc(f.label)} <span class="count"></span></label>
     <input type="search" class="find" placeholder="Filter clients…">
     <div class="checklist">${f.items.map(i => `<label class="ck"><input type="checkbox" name="${f.name}"
@@ -310,7 +330,7 @@ function fieldHTML(f) {
     placeholder="${esc(f.placeholder || '')}" ${f.type === 'number' ? 'min="0" step="any"' : ''}></div>`;
 }
 
-function modal({ title, sub = '', error = '', fields = [], hint = '', ok = 'Save', danger = false, extra = null, wide = false }) {
+function modal({ title, sub = '', error = '', fields = [], hint = '', ok = 'Save', danger = false, extra = null, wide = false, onSync = null }) {
   return new Promise(resolve => {
     const bd = document.createElement('div');
     bd.className = 'backdrop';
@@ -337,10 +357,13 @@ function modal({ title, sub = '', error = '', fields = [], hint = '', ok = 'Save
     if (extra) bd.querySelector('[data-extra]').onclick = () => close({ extra: true });
     const form = bd.querySelector('form');
     const sync = () => {
+      // In field order, so a field hides too when the field it depends on is hidden.
       form.querySelectorAll('[data-show-if]').forEach(el => {
         const [n, v] = el.dataset.showIf.split('=');
-        el.hidden = form.elements[n].value !== v;
+        const dep = form.elements[n];
+        el.hidden = !v.split('|').includes(dep.value) || !!dep.closest('[hidden]');
       });
+      onSync?.(form);
       form.querySelectorAll('.checklist').forEach(l => {
         const n = l.querySelectorAll('input:checked').length;
         l.parentNode.querySelector('.count').textContent = n ? `${n} selected` : '';
@@ -357,7 +380,7 @@ function modal({ title, sub = '', error = '', fields = [], hint = '', ok = 'Save
     form.onsubmit = e => {
       e.preventDefault();
       const fd = new FormData(form), v = Object.fromEntries(fd);
-      for (const f of fields) if (f.type === 'checklist') v[f.name] = fd.getAll(f.name);
+      for (const f of fields) if (f.type === 'checklist' || f.type === 'days') v[f.name] = fd.getAll(f.name);
       close(v);
     };
     document.body.appendChild(bd);
@@ -461,18 +484,55 @@ const MAX_BLOCK_MIN = 7 * 24 * 60;
 const DURATIONS = [['0', 'Until I unblock'], ['15', '15 minutes'], ['30', '30 minutes'], ['60', '1 hour'],
   ['120', '2 hours'], ['240', '4 hours'], ['480', '8 hours'], ['custom', 'Custom…']];
 
-// Block dialog with a duration. Returns minutes (0 = until unblocked) or null.
+const WHEN = [['now', 'Now'], ['delay', 'After a delay (sleep timer)'], ['once', 'At a set time'],
+  ['repeat', 'On a schedule (repeats)']];
+const fmtDays = ds => ds.length === 7 ? 'Every day' : ds.join() === '0,1,2,3,4' ? 'Weekdays'
+  : ds.join() === '5,6' ? 'Weekends' : ds.map(d => DAYN[d]).join(', ');
+const clock = t => new Date(t * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+const dayWord = t => {
+  const d = new Date(t * 1000), days = Math.round((new Date(d).setHours(0, 0, 0, 0) - new Date().setHours(0, 0, 0, 0)) / 864e5);
+  return days === 0 ? 'today' : days === 1 ? 'tomorrow' : d.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' });
+};
+const addMins = (hhmm, m) => { const [h, mi] = hhmm.split(':').map(Number), t = (h * 60 + mi + m) % 1440;
+  return `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`; };
+
+// Block dialog: now or scheduled, with a duration. Returns null or
+// {when: now|delay|once|repeat, minutes, delay_min, at, until, days}.
 async function blockDialog(title, sub, hint) {
-  let error = '', v = { dur: '0', mins: '' };
+  let error = '', v = { when: 'now', dur: '0', mins: '', delay: '30', at: '21:00', until: '06:00', days: [0, 1, 2, 3, 4, 5, 6] };
   for (;;) {
-    v = await modal({ title, sub, hint, error, ok: 'Block', danger: true, fields: [
-      { name: 'dur', label: 'Block for', type: 'select', value: v.dur, options: DURATIONS.map(([value, label]) => ({ value, label })) },
-      { name: 'mins', label: 'Minutes', type: 'number', value: v.mins, placeholder: 'e.g. 45', showIf: ['dur', 'custom'] }] });
-    if (!v) return null;
+    const r = await modal({ title, sub, hint, error, ok: 'Block', danger: true,
+      onSync: f => f.querySelector('button.primary').textContent = f.elements.when.value === 'now' ? 'Block' : 'Schedule',
+      fields: [
+        { name: 'when', label: 'When', type: 'select', value: v.when, options: WHEN.map(([value, label]) => ({ value, label })) },
+        { name: 'delay', label: 'Start in (minutes)', type: 'number', value: v.delay, showIf: ['when', 'delay'] },
+        { name: 'at', label: 'Start at', type: 'time', value: v.at, showIf: ['when', 'once|repeat'] },
+        { name: 'until', label: 'Unblock at', type: 'time', value: v.until, showIf: ['when', 'repeat'] },
+        { name: 'days', label: 'On', type: 'days', value: v.days, showIf: ['when', 'repeat'] },
+        { name: 'dur', label: 'Block for', type: 'select', value: v.dur, options: DURATIONS.map(([value, label]) => ({ value, label })),
+          showIf: ['when', 'now|delay|once'] },
+        { name: 'mins', label: 'Minutes', type: 'number', value: v.mins, placeholder: 'e.g. 45', showIf: ['dur', 'custom'] }] });
+    if (!r) return null;
+    v = { ...r, days: r.days.map(Number) };
     const m = v.dur === 'custom' ? Math.round(+v.mins) : +v.dur;
-    if (m >= 0 && m <= MAX_BLOCK_MIN && (v.dur !== 'custom' || m > 0)) return m;
-    error = `Enter 1 to ${MAX_BLOCK_MIN} minutes (7 days).`;
+    error = v.when !== 'repeat' && !(m >= 0 && m <= MAX_BLOCK_MIN && (v.dur !== 'custom' || m > 0))
+        ? `Enter 1 to ${MAX_BLOCK_MIN} minutes (7 days).`
+      : v.when === 'delay' && !(+v.delay >= 1 && +v.delay <= MAX_BLOCK_MIN) ? 'Enter how many minutes from now to start.'
+      : (v.when === 'once' || v.when === 'repeat') && !v.at ? 'Pick a start time.'
+      : v.when === 'repeat' && (!v.until || v.until === v.at) ? 'Pick an unblock time different from the start time.'
+      : v.when === 'repeat' && !v.days.length ? 'Pick at least one day.' : '';
+    if (!error) return { when: v.when, minutes: v.when === 'repeat' ? 0 : m, delay_min: +v.delay,
+      at: v.at, until: v.until, days: v.days };
   }
+}
+
+// Toast text for a block (now or scheduled) of `name`.
+function blockedMsg(name, r) {
+  const len = r.minutes ? ' for ' + fmtMins(r.minutes) : '';
+  return r.when === 'now' ? `Blocked ${name}${len}`
+    : r.when === 'delay' ? `${name} will be blocked in ${fmtMins(r.delay_min)}${len}`
+    : r.when === 'once' ? `${name} will be blocked at ${r.at}${len}`
+    : `${name} blocked ${fmtDays(r.days).toLowerCase()} ${r.at}–${r.until}`;
 }
 
 // Limit dialog in the unit being shown. Returns {remove: true}, {down, up} in bps, or null.
@@ -597,6 +657,21 @@ function render(d) {
   const clients = grp ? all.filter(c => grp.members.includes(c.ip))
     : filter === 'blocked' ? all.filter(c => c.blocked)
     : filter === 'active' ? all.filter(c => isActive(c) || c.blocked || c.limit) : all;
+  const scheds = d.schedules || [], now = Date.now() / 1000;
+  $('schedCard').hidden = !scheds.length;
+  setHTML($('scheds'), scheds.map(x => {
+    const who = x.kind === 'group' ? `⧉ ${esc(x.name)}` : esc(x.name);
+    const what = x.mode === 'repeat' ? `${fmtDays(x.days)} ${x.at}–${addMins(x.at, x.minutes)}`
+      : `${dayWord(x.at)} ${clock(x.at)} · ${x.minutes ? 'for ' + fmtMins(x.minutes) : 'until unblocked'}`;
+    const when = x.active ? '<span class="badge blk">blocking now</span>'
+      : x.mode === 'repeat' ? `next ${dayWord(x.next)} ${clock(x.next)}` : `starts in ${fmtLeft(x.next - now).replace(' left', '')}`;
+    return `<div class="sched"><div class="what"><b>${who}</b> · ${what}<div class="sub">${when}${
+      x.ips.length ? '' : ' · no client of this on the network right now'}</div></div>
+      <button data-sid="${esc(x.id)}" data-active="${x.active ? 1 : ''}" title="Delete this schedule">Cancel</button></div>`;
+  }).join(''));
+  const nextSched = new Map();   // ip → earliest upcoming scheduled start
+  for (const x of scheds) if (!x.active) for (const ip of x.ips)
+    if (!nextSched.has(ip) || x.next < nextSched.get(ip)) nextSched.set(ip, x.next);
   const groupsOf = new Map();
   for (const g of groups) for (const ip of g.members) groupsOf.set(ip, [...(groupsOf.get(ip) || []), g.name]);
 
@@ -662,8 +737,9 @@ function render(d) {
     tween(td[2].firstChild, c.up, fmtRate);
     setHTML(td[4], `${fmtRate(c.peak_down)}<div class="sub">${fmtRate(c.peak_up)}</div>`);
     setHTML(td[5], `${fmtBytes(c.bytes_down)}<div class="sub">${fmtBytes(c.bytes_up)}</div>`);
-    setHTML(td[6], `${c.blocked ? `<span class="badge blk"${c.block_left != null
-        ? ` title="Unblocks by itself at ${new Date(Date.now() + c.block_left * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}"` : ''}>blocked${
+    const ns = nextSched.get(c.ip);
+    setHTML(td[6], `${ns ? `<span class="badge st" title="Scheduled block starts ${dayWord(ns)} ${clock(ns)}">⏰ ${clock(ns)}</span>` : ''}${c.blocked ? `<span class="badge blk"${c.block_left != null
+        ? ` title="Unblocks by itself at ${clock(Date.now() / 1000 + c.block_left)}"` : ''}>blocked${
         c.block_left != null ? ' · ' + fmtLeft(c.block_left) : ''}</span>` : ''}${c.limit ?
         `<span class="badge lim">↓${fmtLim(c.limit.down)} ↑${fmtLim(c.limit.up)}</span>` : ''}
         <button data-act="limit" data-ip="${c.ip}">${c.limit ? 'Edit limit' : 'Limit'}</button>
@@ -753,6 +829,12 @@ async function groupDialog(g) {
 
 $('newGroup').onclick = () => last && groupDialog(null);
 
+$('scheds').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-sid]'); if (!b) return;
+  if (await control({ action: 'unschedule', id: b.dataset.sid }, b))
+    toast(b.dataset.active ? 'Schedule cancelled · the block running now stays until it ends (Unblock ends it now)' : 'Schedule cancelled');
+});
+
 $('groups').addEventListener('click', async e => {
   const b = e.target.closest('[data-gact]'); if (!b || !last) return;
   const g = (last.groups || []).find(x => x.id === b.closest('.group').dataset.gid); if (!g) return;
@@ -770,12 +852,17 @@ $('groups').addEventListener('click', async e => {
     groupDialog(g);
 
   } else if (act === 'block') {
-    const m = await blockDialog(`Block group “${g.name}”?`, plural(n),
-      'Cuts internet for every client in the group right away. Their DHCP leases are made static. '
+    const r = await blockDialog(`Block group “${g.name}”?`, plural(n),
+      'Cuts internet for every client in the group. Their DHCP leases are made static. '
+      + 'A scheduled block uses whoever is in the group when it starts. '
       + 'A timed block is lifted by the router itself, even if this dashboard is off.');
-    if (m === null) return;
-    const j = await control({ action: 'group', id: g.id, op: 'block', minutes: m }, b);
-    if (j) toast(`Blocked ${plural(j.done)} in ${g.name}${m ? ' for ' + fmtMins(m) : ''}${skipped(j)}`);
+    if (!r) return;
+    if (r.when !== 'now') {
+      if (await control({ action: 'schedule', group: g.id, ...r }, b)) toast(blockedMsg(g.name, r));
+      return;
+    }
+    const j = await control({ action: 'group', id: g.id, op: 'block', minutes: r.minutes }, b);
+    if (j) toast(`Blocked ${plural(j.done)} in ${g.name}${r.minutes ? ' for ' + fmtMins(r.minutes) : ''}${skipped(j)}`);
 
   } else if (act === 'unblock') {
     const j = await control({ action: 'group', id: g.id, op: 'unblock' }, b);
@@ -828,11 +915,12 @@ $('rows').addEventListener('click', async e => {
     }
 
   } else if (b.dataset.act === 'block') {
-    const m = await blockDialog('Block client?', label(c),
-      'Cuts its internet access right away. Its DHCP lease is made static so it keeps this IP. '
+    const r = await blockDialog('Block client?', label(c),
+      'Cuts its internet access. Its DHCP lease is made static so it keeps this IP. '
       + 'A timed block is lifted by the router itself, even if this dashboard is off.');
-    if (m !== null && await control({ action: 'block', ip, minutes: m }, b))
-      toast(`Blocked ${c.name || ip}${m ? ' for ' + fmtMins(m) : ''}`);
+    if (r && await control(r.when === 'now' ? { action: 'block', ip, minutes: r.minutes }
+                                            : { action: 'schedule', ip, ...r }, b))
+      toast(blockedMsg(c.name || ip, r));
 
   } else if (b.dataset.act === 'unblock') {
     if (await control({ action: 'unblock', ip }, b)) toast(`Unblocked ${c.name || ip}`);

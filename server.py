@@ -14,13 +14,13 @@ Configured by environment variables (defaults in brackets):
   LAN_CIDR        LAN subnet                              [192.168.88.0/24]
   ROUTER_IP       router's LAN IP (excluded)              [192.168.88.1]
   STATIC_NAMES    JSON {ip: name} for lease-less clients  [{}]
-  DATA_DIR        where aliases.json / groups.json live   [script dir]
+  DATA_DIR        where aliases/groups/schedules live     [script dir]
   BIND, PORT      listen address                          [127.0.0.1, 8088]
   DASH_PASSWORD   initial login password; can be changed  [] (no login)
                   in the dashboard, changing it here resets that
   SSH_KNOWN_HOSTS known_hosts file; auto-accepts new keys []
 """
-import argparse, hashlib, hmac, ipaddress, json, os, re, secrets, subprocess, threading, time
+import argparse, datetime, hashlib, hmac, ipaddress, json, math, os, re, secrets, subprocess, threading, time
 from collections import deque
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -41,6 +41,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = env("DATA_DIR", HERE)
 ALIASES = os.path.join(DATA_DIR, "aliases.json")   # {MAC or "ip:<ip>": alias}
 GROUPS = os.path.join(DATA_DIR, "groups.json")     # [{id, name, members: [MAC or "ip:<ip>"]}]
+SCHEDULES = os.path.join(DATA_DIR, "schedules.json")  # scheduled blocks, see "Schedules" below
 MAX_BLOCK_MIN = 7 * 24 * 60                        # longest temporary block
 CTL = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", f"mikrotik-dash-{os.getuid()}.sock")
 SSH_OPTS = ["-o", "LogLevel=ERROR", "-o", "BatchMode=yes",
@@ -298,12 +299,18 @@ def load_groups():
 groups = load_groups()
 
 
+def key_ips(keys):
+    """Current IPs for alias-style keys (MAC or "ip:<ip>"), None where the MAC
+    isn't on the network right now. Call with lock held."""
+    ip_of = {f"ip:{ip}": ip for ip in state["names"]}
+    ip_of.update({n["mac"].upper(): ip for ip, n in state["names"].items() if n.get("mac")})
+    return [ip_of.get(k) or (k[3:] if k.startswith("ip:") else None) for k in keys]
+
+
 def member_ips(g):
     """Current IPs of a group's members (call with lock held). Members are kept
     by MAC like aliases, so they follow a device across IP changes."""
-    ip_of = {f"ip:{ip}": ip for ip in state["names"]}
-    ip_of.update({n["mac"].upper(): ip for ip, n in state["names"].items() if n.get("mac")})
-    return [ip_of.get(k) or (k[3:] if k.startswith("ip:") else None) for k in g["members"]]
+    return key_ips(g["members"])
 
 
 def save_group(gid, name, ips):
@@ -329,6 +336,8 @@ def delete_group(gid):
     with lock:
         groups[:] = [g for g in groups if g["id"] != gid]
         save_json(GROUPS, groups)
+        schedules[:] = [x for x in schedules if x["target"].get("group") != gid]
+        save_json(SCHEDULES, schedules)
 
 
 def group_action(gid, op, minutes=0, down=0, up=0):
@@ -358,6 +367,185 @@ def group_action(gid, op, minutes=0, down=0, up=0):
     if errors:
         raise RuntimeError(f"{len(errors)} of {len(done)} failed — " + "; ".join(errors[:3]))
     return len(done), len(ips) - len(done)
+
+
+# --- Schedules ---------------------------------------------------------------
+# Scheduled blocks ("sleep timer"). RouterOS device-mode blocks /system scheduler
+# on this router, so the dashboard starts them; each one is a timed block, so
+# the router still ends it on time by itself. Times are in the router's timezone.
+#   {id, target: {"client": key} | {"group": id}, mode: "once" | "repeat",
+#    at: epoch (once) | "HH:MM" (repeat), days: [0=Mon..6] (repeat),
+#    minutes: block length (0 = until unblocked; once only), last: epoch of the
+#    last start it applied (repeat)}
+# A start missed while the dashboard was down still applies, for what is left.
+schedules = []
+try:
+    with open(SCHEDULES) as f:
+        schedules = json.load(f)
+except (FileNotFoundError, ValueError):
+    pass
+router_tz = None
+
+
+def tz():
+    """The router's timezone as a fixed offset (read once; falls back to local)."""
+    global router_tz
+    if router_tz is None:
+        try:
+            off = ros(":put [/system clock get gmt-offset]").strip()
+            m = re.fullmatch(r"([+-])(\d+):(\d+)", off)
+            secs = (int(m[2]) * 3600 + int(m[3]) * 60) * (-1 if m[1] == "-" else 1) if m else int(off)
+            router_tz = datetime.timezone(datetime.timedelta(seconds=secs))
+        except Exception:
+            return datetime.datetime.now().astimezone().tzinfo
+    return router_tz
+
+
+def parse_hhmm(v):
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", str(v or ""))
+    if not m or int(m[1]) > 23 or int(m[2]) > 59:
+        raise ValueError("time must be HH:MM")
+    return int(m[1]), int(m[2])
+
+
+def starts_around(x, now):
+    """For a repeating schedule: (latest start <= now, next start > now), as epochs."""
+    h, mi = parse_hhmm(x["at"])
+    today = datetime.datetime.fromtimestamp(now, tz()).replace(hour=h, minute=mi, second=0, microsecond=0)
+    cands = [today + datetime.timedelta(days=d) for d in range(-7, 8)]
+    cands = [c.timestamp() for c in cands if c.weekday() in x["days"]]
+    return max(c for c in cands if c <= now), min(c for c in cands if c > now)
+
+
+def schedule_view(x, now):
+    """What the page shows for a schedule (call with lock held)."""
+    t = x["target"]
+    if "group" in t:
+        g = next((g for g in groups if g["id"] == t["group"]), None)
+        name, ips = (g["name"], [ip for ip in member_ips(g) if ip]) if g else ("?", [])
+    else:
+        ip = key_ips([t["client"]])[0]
+        ips = [ip] if ip else []
+        name = (alias_for(ip) or state["names"].get(ip, {}).get("name", "") or ip) if ip else t["client"]
+    if x["mode"] == "once":
+        nxt, active = x["at"], False
+    else:
+        prev, nxt = starts_around(x, now)
+        active = now < prev + x["minutes"] * 60
+    return {"id": x["id"], "kind": "group" if "group" in t else "client", "name": name, "ips": ips,
+            "mode": x["mode"], "at": x["at"], "days": x.get("days"), "minutes": x["minutes"],
+            "next": nxt, "active": active}
+
+
+def add_schedule(req):
+    """Create a scheduled block from a /api/control request."""
+    now = time.time()
+    if req.get("group"):
+        gid = str(req["group"])
+        if not any(g["id"] == gid for g in groups):
+            raise ValueError("no such group")
+        target = {"group": gid}
+    else:
+        ip = str(req.get("ip", ""))
+        if not lan_ip(ip):
+            raise ValueError("not a LAN client IP")
+        with lock:
+            target = {"client": alias_key(ip)}
+    when = req.get("when")
+    minutes = int(float(req.get("minutes") or 0))
+    x = {"id": secrets.token_hex(4), "target": target, "minutes": minutes}
+    if when == "delay":
+        delay = float(req.get("delay_min") or 0)
+        if not 1 <= delay <= MAX_BLOCK_MIN:
+            raise ValueError("start delay must be 1 minute to 7 days")
+        x.update(mode="once", at=round(now + delay * 60))
+    elif when == "once":
+        h, mi = parse_hhmm(req.get("at"))
+        start = datetime.datetime.fromtimestamp(now, tz()).replace(hour=h, minute=mi, second=0, microsecond=0)
+        if start.timestamp() <= now:
+            start += datetime.timedelta(days=1)
+        x.update(mode="once", at=start.timestamp())
+    elif when == "repeat":
+        h, mi = parse_hhmm(req.get("at"))
+        uh, um = parse_hhmm(req.get("until"))
+        minutes = (uh * 60 + um - h * 60 - mi) % (24 * 60)
+        days = sorted({int(d) for d in req.get("days") or [] if 0 <= int(d) <= 6})
+        if not minutes:
+            raise ValueError("start and end time are the same")
+        if not days:
+            raise ValueError("pick at least one day")
+        x.update(mode="repeat", at=f"{h:02d}:{mi:02d}", days=days, minutes=minutes, last=0)
+    else:
+        raise ValueError("unknown schedule type")
+    with lock:
+        schedules.append(x)
+        save_json(SCHEDULES, schedules)
+    wake_scheduler.set()   # a schedule that is already due (e.g. inside tonight's window) applies now
+    return x
+
+
+def delete_schedule(sid):
+    with lock:
+        schedules[:] = [x for x in schedules if x["id"] != sid]
+        save_json(SCHEDULES, schedules)
+
+
+def run_schedule(x, minutes):
+    """Block the schedule's target now for minutes (0 = until unblocked). A
+    client that is already blocked with no end is left alone."""
+    with lock:
+        ips = schedule_view(x, time.time())["ips"]
+        permanent = {ip for ip in state["blocked"] if ip not in state["block_until"]}
+    for ip in ips:
+        if ip in permanent:
+            continue
+        try:
+            set_block(ip, True, minutes, refresh=False)
+        except Exception as e:
+            print(f"schedule {x['id']}: blocking {ip} failed: {e}", flush=True)
+    refresh_controls()
+
+
+wake_scheduler = threading.Event()
+
+
+def scheduler():
+    """Every 15 s, start any scheduled block that is due."""
+    started = False
+    while True:
+        wake_scheduler.wait(timeout=15)
+        wake_scheduler.clear()
+        try:
+            if not started:   # names (MAC → IP) and current blocks are needed first
+                refresh_names()
+                refresh_controls()
+                started = True
+            now = time.time()
+            due = []
+            with lock:
+                for x in list(schedules):
+                    if x["mode"] == "once" and now >= x["at"]:
+                        schedules.remove(x)
+                        left = x["minutes"] * 60 - (now - x["at"])
+                        if not x["minutes"]:
+                            if now - x["at"] < 3600:   # open-ended: skip if over an hour late
+                                due.append((x, 0))
+                        elif left > 30:
+                            due.append((x, max(1, math.ceil(left / 60))))
+                    elif x["mode"] == "repeat":
+                        prev, _ = starts_around(x, now)
+                        left = x["minutes"] * 60 - (now - prev)
+                        if prev > x.get("last", 0) and left > 30:
+                            x["last"] = prev
+                            due.append((x, max(1, math.ceil(left / 60))))
+                if due:
+                    save_json(SCHEDULES, schedules)
+            if due:
+                refresh_names()   # resolve MACs to today's IPs
+            for x, minutes in due:
+                run_schedule(x, minutes)
+        except Exception as e:
+            print(f"scheduler: {e}", flush=True)
 
 
 def sample():
@@ -472,7 +660,10 @@ def snapshot():
             })
         grp = [{"id": g["id"], "name": g["name"], "members": [ip for ip in member_ips(g) if ip],
                 "missing": sum(1 for ip in member_ips(g) if not ip)} for g in groups]
-        return {"clients": out, "groups": grp, "updated": state["updated"], "error": state["error"],
+        now = time.time()
+        sch = sorted((schedule_view(x, now) for x in schedules), key=lambda v: v["next"])
+        return {"clients": out, "groups": grp, "schedules": sch,
+                "updated": state["updated"], "error": state["error"],
                 "paused": state["paused"],
                 "sample": SAMPLE}
 
@@ -640,6 +831,12 @@ class Handler(BaseHTTPRequestHandler):
             if action == "group_delete":
                 delete_group(str(req.get("id", "")))
                 return self.reply(200, json.dumps(body).encode(), "application/json")
+            if action == "schedule":
+                add_schedule(req)
+                return self.reply(200, json.dumps(body).encode(), "application/json")
+            if action == "unschedule":
+                delete_schedule(str(req.get("id", "")))
+                return self.reply(200, json.dumps(body).encode(), "application/json")
             if action == "group":
                 body["done"], body["skipped"] = group_action(
                     str(req.get("id", "")), req.get("op"), minutes, down, up)
@@ -670,6 +867,7 @@ if __name__ == "__main__":
     args = ap.parse_args()
     os.makedirs(DATA_DIR, exist_ok=True)
     threading.Thread(target=poller, daemon=True).start()
+    threading.Thread(target=scheduler, daemon=True).start()
     print(f"MikroTik dashboard on http://{args.bind}:{args.port}"
           f" ({'password protected' if auth else 'no password'})", flush=True)
     ThreadingHTTPServer((args.bind, args.port), Handler).serve_forever()
